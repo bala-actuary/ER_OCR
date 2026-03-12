@@ -1,0 +1,27 @@
+# Input/Output data (large PDF and CSV files)
+Input/
+output/
+
+# Checkpoints
+checkpoints/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
