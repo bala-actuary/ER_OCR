@@ -574,6 +574,57 @@ def ocr_serial_targeted(cell_img: np.ndarray) -> str:
     return ""
 
 
+def _extract_age_gender_targeted(cell_img: np.ndarray, record: dict) -> None:
+    """
+    Targeted age/gender extraction from the bottom portion of a cell.
+    Age and Gender labels sit at the bottom of voter cells. When full-cell OCR
+    misses them (e.g., due to noise or misalignment), this re-OCRs just the
+    bottom region with focused settings.
+    """
+    h, w = cell_img.shape[:2]
+    # Bottom 25% of the cell where Age/Gender typically appears
+    roi = cell_img[int(h * 0.75):, :]
+    if roi.size == 0:
+        return
+
+    scale = 4
+    upscaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+
+    if len(upscaled.shape) == 3:
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = upscaled
+
+    thresh = preprocess_for_ocr(gray)
+    text = pytesseract.image_to_string(thresh, lang="eng", config="--psm 6 --oem 1 --dpi 300")
+
+    if not record["age"]:
+        ag_match = AGE_GENDER_RE.search(text)
+        if ag_match:
+            try:
+                age_val = int(ag_match.group(1))
+                if 18 <= age_val <= 120:
+                    record["age"] = ag_match.group(1)
+            except ValueError:
+                pass
+            if not record["gender"]:
+                record["gender"] = normalize_gender(ag_match.group(2))
+        else:
+            age_match = AGE_RE.search(text)
+            if age_match:
+                try:
+                    age_val = int(age_match.group(1))
+                    if 18 <= age_val <= 120:
+                        record["age"] = age_match.group(1)
+                except ValueError:
+                    pass
+
+    if not record["gender"]:
+        gender_match = GENDER_RE.search(text)
+        if gender_match:
+            record["gender"] = normalize_gender(gender_match.group(1))
+
+
 def ocr_cell_english(cell_img: np.ndarray) -> dict:
     """OCR a single cell from the English PDF and parse fields."""
     # Upscale 4x with Lanczos for sharper text
@@ -622,27 +673,38 @@ def ocr_epic_id_targeted(cell_img: np.ndarray) -> Optional[str]:
     """
     Targeted EPIC ID extraction from the top-right area of a cell.
     Uses character allowlist for better accuracy.
+    Tries multiple ROI sizes to handle shifted cell boundaries.
     """
     h, w = cell_img.shape[:2]
-    # EPIC ID is in the top-right portion of the cell
-    roi = cell_img[0:int(h * 0.3), int(w * 0.4):]
-
-    scale = 4
-    upscaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
-
-    if len(upscaled.shape) == 3:
-        gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = upscaled
-
-    thresh = preprocess_for_ocr(gray)
-
     config = "--psm 7 --oem 1 --dpi 300 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    text = pytesseract.image_to_string(thresh, lang="eng", config=config).strip()
 
-    epic_id = fix_epic_id(text)
-    if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
-        return epic_id
+    # Try multiple ROI regions: primary tight, then progressively wider
+    rois = [
+        (0, int(h * 0.3), int(w * 0.4), w),         # Primary: top 30%, right 60%
+        (0, int(h * 0.35), int(w * 0.3), w),         # Wider: top 35%, right 70%
+        (0, int(h * 0.4), int(w * 0.2), w),          # Widest: top 40%, right 80%
+    ]
+
+    for y1, y2, x1, x2 in rois:
+        roi = cell_img[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+
+        scale = 4
+        upscaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+
+        if len(upscaled.shape) == 3:
+            gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = upscaled
+
+        thresh = preprocess_for_ocr(gray)
+        text = pytesseract.image_to_string(thresh, lang="eng", config=config).strip()
+
+        epic_id = fix_epic_id(text)
+        if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
+            return epic_id
+
     return None
 
 
@@ -855,7 +917,7 @@ def parse_english_text(text: str) -> dict:
 
 
 def _clean_tamil_text(text: str) -> str:
-    """Clean Tamil OCR text: remove zero-width chars, label prefixes, trailing dashes, label noise."""
+    """Clean Tamil OCR text: remove zero-width chars, label prefixes, trailing dashes, label noise, ASCII contamination."""
     # Remove zero-width non-joiner and similar invisible chars
     text = text.replace("\u200c", "").replace("\u200d", "").replace("\u200b", "")
     # Remove Tamil label prefixes that leak into the value
@@ -865,6 +927,21 @@ def _clean_tamil_text(text: str) -> str:
     # Filter out form label noise (e.g., "28 பாலினம் : ஆண்" = Age+Gender)
     if TAMIL_LABEL_NOISE_RE.search(text):
         return ""
+    # Strip ASCII contamination: remove English letters, digits, and common noise chars
+    # Keep Tamil Unicode (U+0B80–U+0BFF), spaces, hyphens, periods, and other Indic scripts
+    cleaned = []
+    for ch in text:
+        if "\u0B80" <= ch <= "\u0BFF":   # Tamil Unicode block
+            cleaned.append(ch)
+        elif ch in " .-'":               # Allowed punctuation
+            cleaned.append(ch)
+        elif ord(ch) > 127:              # Other non-ASCII (keep Tamil punctuation, etc.)
+            cleaned.append(ch)
+        # ASCII letters, digits, and symbols are dropped
+    text = "".join(cleaned)
+    # Collapse multiple spaces and clean up
+    text = re.sub(r"\s{2,}", " ", text)
+    text = text.strip(" .-'")
     return text
 
 
@@ -903,6 +980,36 @@ def parse_tamil_text(text: str) -> dict:
         if rel_match:
             result["relation_name_tamil"] = _clean_tamil_text(rel_match.group(1))
             continue
+
+    # Fallback for relation name: if name was found but relation regex failed,
+    # look for any line after the name line that contains பெயர் (indicating a
+    # relation label with garbled prefix) and extract the value after it.
+    if result["name_tamil"] and not result["relation_name_tamil"]:
+        found_name_line = False
+        for line in lines:
+            if not found_name_line:
+                if result["name_tamil"] in line or TAMIL_NAME_RE.search(line):
+                    found_name_line = True
+                continue
+            # Skip non-data lines
+            if any(skip in line.lower() for skip in ["available", "photo"]):
+                continue
+            if TAMIL_LABEL_NOISE_RE.search(line):
+                continue
+            # Look for பெயர் with any garbled prefix (OCR-damaged relation label)
+            rel_fallback = re.search(r"பெயர்\s*[:.\-]?\s*(.+?)(?:\s*-\s*)?$", line)
+            if rel_fallback:
+                value = _clean_tamil_text(rel_fallback.group(1))
+                if value and any("\u0B80" <= c <= "\u0BFF" for c in value):
+                    result["relation_name_tamil"] = value
+                    break
+            # Also try colon-separated value on lines with Tamil text
+            colon_match = re.search(r"[:：]\s*(.+?)(?:\s*-\s*)?$", line)
+            if colon_match:
+                value = _clean_tamil_text(colon_match.group(1))
+                if value and any("\u0B80" <= c <= "\u0BFF" for c in value):
+                    result["relation_name_tamil"] = value
+                    break
 
     # If regex didn't match, try positional extraction:
     # In Tamil cells, line 2 is typically name, line 3 is relation
@@ -958,6 +1065,10 @@ def fix_epic_id(raw: str) -> str:
             chars[i] = letter_fixes[chars[i]]
 
     result = "".join(chars)
+
+    # Fix 6-digit EPIC IDs by zero-padding (e.g., RVJ297066 → RVJ0297066)
+    if re.match(r"^[A-Z]{3}\d{6}$", result):
+        result = result[:3] + "0" + result[3:]
 
     # Try to correct prefix using known valid prefixes (Levenshtein distance 1)
     prefix = result[:3]
@@ -1050,6 +1161,16 @@ def clean_house_no(raw: str) -> str:
     # Step 4: Clean up spacing and formatting
     raw = re.sub(r"\s{2,}", " ", raw).strip()
     raw = raw.strip("-/ ")
+
+    # Step 4b: Remove leading noise from label bleed (e.g., "'s " from "Father's")
+    raw = re.sub(r"^['\"]?s\s+", "", raw)
+
+    # Step 4c: Remove unmatched/trailing parentheses
+    # e.g., "2/1999)" → "2/1999", "(3/4581-H" → "3/4581-H"
+    if "(" in raw and ")" not in raw:
+        raw = raw.replace("(", "")
+    if ")" in raw and "(" not in raw:
+        raw = raw.replace(")", "")
 
     # Step 5: Fix common OCR letter-for-digit confusion in leading position
     # House numbers start with digits. A leading single letter before digits/space
@@ -1325,10 +1446,12 @@ def is_summary_or_legend_page(text: str) -> bool:
 def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
     """
     OCR a Tamil page and return a dict of {epic_id: {name_tamil, relation_name_tamil}}.
-    Also returns a dict keyed by serial_no as fallback under "_by_serial" key.
+    Also returns fallback dicts under "_by_serial" (keyed by serial_no) and
+    "_by_position" (keyed by cell index) for position-based last-resort matching.
     """
     result_by_epic = {}
     result_by_serial = {}
+    result_by_position = {}
 
     try:
         tam_img = extract_image_from_pdf(tam_path)
@@ -1340,7 +1463,7 @@ def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
     if not tam_cells:
         return result_by_epic
 
-    for x1, y1, x2, y2 in tam_cells:
+    for i, (x1, y1, x2, y2) in enumerate(tam_cells):
         cell_img = tam_img[y1:y2, x1:x2]
         if cell_img.size == 0:
             continue
@@ -1356,19 +1479,22 @@ def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
         # Serial number extraction using targeted top-left ROI (fallback matching)
         serial_no = tam_data["serial_no"] or ocr_serial_targeted(cell_img)
 
+        tam_entry = {
+            "name_tamil": tam_data["name_tamil"],
+            "relation_name_tamil": tam_data["relation_name_tamil"],
+        }
+
         if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
-            result_by_epic[epic_id] = {
-                "name_tamil": tam_data["name_tamil"],
-                "relation_name_tamil": tam_data["relation_name_tamil"],
-            }
+            result_by_epic[epic_id] = tam_entry
 
         if serial_no:
-            result_by_serial[serial_no] = {
-                "name_tamil": tam_data["name_tamil"],
-                "relation_name_tamil": tam_data["relation_name_tamil"],
-            }
+            result_by_serial[serial_no] = tam_entry
+
+        # Always store by position for last-resort fallback
+        result_by_position[i] = tam_entry
 
     result_by_epic["_by_serial"] = result_by_serial
+    result_by_epic["_by_position"] = result_by_position
     return result_by_epic
 
 
@@ -1508,6 +1634,10 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
 
         record = ocr_cell_english(cell_img)
 
+        # Targeted age/gender extraction from bottom of cell when main OCR missed them
+        if not record["age"] or not record["gender"]:
+            _extract_age_gender_targeted(cell_img, record)
+
         # Targeted serial number extraction from the top-left box
         if not record["serial_no"]:
             targeted_serial = ocr_serial_targeted(cell_img)
@@ -1555,6 +1685,7 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
         if tam_path:
             tam_data = _ocr_tamil_page(tam_path)
             serial_data = tam_data.pop("_by_serial", {})
+            position_data = tam_data.pop("_by_position", {})
 
             # First pass: merge by EPIC ID
             for record in eng_records:
@@ -1571,6 +1702,18 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
                 if serial and serial in serial_data:
                     record["name_tamil"] = serial_data[serial]["name_tamil"]
                     record["relation_name_tamil"] = serial_data[serial]["relation_name_tamil"]
+
+            # Third pass: fill remaining gaps using cell position matching
+            # Both EN and TA pages share the same grid layout, so cell N maps to cell N
+            for record in eng_records:
+                if record.get("name_tamil"):
+                    continue
+                cell_idx = record.get("_cell_index")
+                if cell_idx is not None and cell_idx in position_data:
+                    pos_entry = position_data[cell_idx]
+                    if pos_entry["name_tamil"]:
+                        record["name_tamil"] = pos_entry["name_tamil"]
+                        record["relation_name_tamil"] = pos_entry["relation_name_tamil"]
 
             # Cross-validate: fill serial gaps from Tamil page serials
             for record in eng_records:
