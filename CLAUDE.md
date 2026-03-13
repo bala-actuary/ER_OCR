@@ -1,14 +1,14 @@
-# Electoral Roll PDF Extraction — OCR Approach (Claude Code Context)
+# Electoral Roll PDF Extraction — OCR Approach (v1.0)
 
 ## Purpose
 
-Local OCR-based alternative to the LLM approach. Extracts voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV. Zero API cost — uses Tesseract OCR + OpenCV locally.
+Local OCR-based tool to extract voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV. Zero API cost — uses Tesseract OCR + OpenCV locally.
 
 ## Architecture
 
 ```
-PDF → PyMuPDF (extract image) → OpenCV (detect grid, crop cells)
-    → Tesseract OCR (per cell) → Regex parsing → Merge EN+TA → CSV
+PDF -> PyMuPDF (extract image) -> OpenCV (detect grid, crop cells)
+    -> Tesseract OCR (per cell) -> Regex parsing -> Merge EN+TA -> CSV
 ```
 
 | Component | Library |
@@ -20,19 +20,31 @@ PDF → PyMuPDF (extract image) → OpenCV (detect grid, crop cells)
 | Field parsing | Python `re` with fuzzy label matching |
 | Tamil matching | EPIC ID + serial number + position-based fallback |
 
-## Key File
+## Key Files
 
-- `extract_ocr.py` — Single-file script containing all logic (~2100 lines)
+- `extract_ocr.py` — Main OCR extraction script (~2100 lines)
+- `split_pdfs.py` — Splits multi-page PDFs into individual page files
+- `merge_outputs.py` — Merges page-level CSVs into part-level CSVs
 - `analyze_quality.py` — Quality analysis script for validating extraction accuracy
+- `check-progress.sh` — Progress monitoring
+- `setup.bat` — Automated setup (Windows)
+
+## Workflow
+
+```
+1. split_pdfs.py    — Split downloaded PDFs into pages
+2. extract_ocr.py   — OCR extract data from each page pair
+3. merge_outputs.py  — Merge page CSVs back into part-level files
+```
 
 ## Input/Output
 
-- **Input**: `Input/split_files/{directory}/english/` and `tamil/` (local to ER_OCR)
-- **Output**: `output/{directory}/` — one CSV per input English PDF pair
-- **Output filename**: matches English PDF name with `.csv` extension
-  - e.g., `2026-EROLLGEN-S22-184-SIR-FinalRoll-Revision1-ENG-301-WI_page_10.csv`
-- **Non-data pages** (summary, legend): produce header-only CSV (0 records)
-- **Checkpoints**: `checkpoints/{dir_name}.json` — tracks processed filenames
+- **Downloads**: `Input/ER_Downloads/AC-xxx/{english,tamil}/` — original multi-page PDFs
+- **Split pages**: `Input/split_files/AC-xxx/{english,tamil}/` — one PDF per page
+- **Page CSVs**: `output/split_files/AC-xxx/` — one CSV per English page
+- **Merged CSVs**: `output/merged/AC-xxx/` — one CSV per original part file
+- **Checkpoints**: `Input/split_files/AC-xxx/checkpoint.json` — tracks processed filenames
+- **Logs**: `logs/extract_{AC}_{timestamp}.log` and `_summary.json`
 
 ## CSV Output Format (14 columns)
 
@@ -67,19 +79,35 @@ From TAMIL PDF (matched by EPIC ID, serial number, or cell position): name_tamil
 ## CLI Usage
 
 ```bash
-python extract_ocr.py AC-184-Part-1-50 --validate       # Test 1 pair
-python extract_ocr.py AC-184-Part-1-50 --limit 10       # Process 10 pairs
-python extract_ocr.py AC-184-Part-1-50 --workers 4      # Process full directory
-python extract_ocr.py --all --workers 4                  # All 8 directories
-python extract_ocr.py AC-184-Part-1-50 --dry-run         # Show pending pairs
-python extract_ocr.py AC-184-Part-1-50 --reset           # Reset checkpoint
-bash check-progress.sh                                    # Monitor progress
+# Split PDFs
+python split_pdfs.py --ac AC-188              # Split PDFs for an AC
+python split_pdfs.py                           # Interactive prompt
+
+# Extract data
+python extract_ocr.py AC-188 --validate        # Test 1 pair
+python extract_ocr.py AC-188 --workers 4       # Process full AC
+python extract_ocr.py AC-188 --part 101        # Process specific part
+python extract_ocr.py AC-188 --part 50-100     # Process part range
+python extract_ocr.py --all --workers 4         # All AC directories
+python extract_ocr.py AC-188 --dry-run          # Show pending pairs
+python extract_ocr.py AC-188 --reset --part 101 # Reset specific part
+python extract_ocr.py                           # Interactive prompt
+
+# Merge outputs
+python merge_outputs.py --ac AC-188            # Merge page CSVs to part CSVs
+python merge_outputs.py                         # Interactive prompt
+
+# Monitor
+bash check-progress.sh                          # Check progress
+python analyze_quality.py --ac AC-188          # Quality analysis
 ```
 
 ## Critical Rules
 
 - **Tamil page = English page + 1** (offset baked into PDF naming)
+- **English PDFs skip first 2 pages**, Tamil skip first 3 (metadata pages)
 - **One output CSV per input English PDF** — enables 1:1 input/output traceability
-- **Checkpoint per directory** — supports parallel sessions on different directories
-- **Grid detection uses multi-scale + fallback chain**: morphological → Hough lines → contours → proportional
+- **Checkpoint per AC directory** — supports parallel sessions on different ACs
+- **Grid detection uses multi-scale + fallback chain**: morphological -> Hough lines -> contours -> proportional
 - **Column collapse guard**: if detected columns span <85% of page width, falls back to proportional `[2%, 34%, 66%, 98%]`
+- **Legacy batch dirs** (AC-184-Part-1-50 etc.) still work with extract_ocr.py for backward compatibility

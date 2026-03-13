@@ -7,12 +7,18 @@ into structured CSV files. Uses PyMuPDF for image extraction, OpenCV for grid
 detection, and Tesseract OCR for text recognition.
 
 Usage:
-    python extract_ocr.py AC-184-Part-1-50                # Process one directory
-    python extract_ocr.py AC-184-Part-1-50 --validate     # Test on 1 pair
-    python extract_ocr.py --all --workers 4               # Process all directories
-    python extract_ocr.py AC-184-Part-1-50 --dry-run      # Show pairs only
-    python extract_ocr.py AC-184-Part-1-50 --reset        # Reset checkpoint
-    python extract_ocr.py AC-184-Part-1-50 --limit 10     # Process only 10 pairs
+    python extract_ocr.py AC-188                          # Process one AC directory
+    python extract_ocr.py AC-188 --validate               # Test on 1 pair
+    python extract_ocr.py --all --workers 4               # Process all AC directories
+    python extract_ocr.py AC-188 --dry-run                # Show pairs only
+    python extract_ocr.py AC-188 --part 101                # Process only Part 101
+    python extract_ocr.py AC-188 --part 50-100             # Process Parts 50 to 100
+    python extract_ocr.py AC-188 --part 1,5,10-20          # Specific parts and ranges
+    python extract_ocr.py AC-188 --reset                   # Reset checkpoint (all parts)
+    python extract_ocr.py AC-188 --reset --part 101        # Reset only Part 101
+    python extract_ocr.py AC-188 --reset --part 50-100     # Reset Parts 50 to 100
+    python extract_ocr.py AC-188 --limit 10                # Process only 10 pairs
+    python extract_ocr.py                                  # Interactive prompt
 """
 
 import argparse
@@ -21,12 +27,14 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import traceback
 import unicodedata
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -48,20 +56,13 @@ except ImportError:
 # ----- Configuration -----
 
 OCR_DIR = Path(__file__).parent          # ER_OCR/
-INPUT_DIR = OCR_DIR / "Input" / "split_files"
-OUTPUT_DIR = OCR_DIR / "output"
-CHECKPOINT_DIR = OCR_DIR / "checkpoints"
+INPUT_BASE = OCR_DIR / "Input" / "split_files"
+OUTPUT_BASE = OCR_DIR / "output" / "split_files"
+MERGED_BASE = OCR_DIR / "output" / "merged"
+LOG_DIR = OCR_DIR / "logs"
 
-BATCH_DIRS = [
-    "AC-184-Part-1-50",
-    "AC-184-Part-51-100",
-    "AC-184-Part-101-150",
-    "AC-184-Part-151-200",
-    "AC-184-Part-201-250",
-    "AC-184-Part-251-300",
-    "AC-184-Part-301-350",
-    "AC-184-Part-351-400",
-]
+# Legacy paths (for backward compatibility with old checkpoint location)
+_LEGACY_CHECKPOINT_DIR = OCR_DIR / "checkpoints"
 
 CSV_HEADERS = [
     "AC No", "Part No", "Serial No", "EPIC ID",
@@ -86,9 +87,28 @@ def setup_logging(log_file: Path = None):
     log.addHandler(console)
 
     if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(fmt)
         log.addHandler(fh)
+
+
+# ----- Part Range Parsing -----
+
+def parse_part_range(part_str: str) -> set[int]:
+    """Parse a --part argument into a set of part numbers.
+
+    Accepts: single part (101), range (50-100), or comma-separated (1,5,10-20).
+    """
+    parts = set()
+    for segment in part_str.split(","):
+        segment = segment.strip()
+        if "-" in segment:
+            start, end = segment.split("-", 1)
+            parts.update(range(int(start), int(end) + 1))
+        else:
+            parts.add(int(segment))
+    return parts
 
 
 # ----- Filename Parsing -----
@@ -183,13 +203,22 @@ def discover_pairs(directory: Path) -> list[dict]:
 # ----- Checkpoint -----
 
 def _checkpoint_path(dir_name: str) -> Path:
-    """Return checkpoint file path for a batch directory (stored under ocr/checkpoints/)."""
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    return CHECKPOINT_DIR / f"{dir_name}.json"
+    """Return checkpoint file path inside the split_files/AC-xxx/ directory."""
+    cp_path = INPUT_BASE / dir_name / "checkpoint.json"
+    cp_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Auto-migrate from legacy checkpoints/ location
+    if not cp_path.exists():
+        legacy_path = _LEGACY_CHECKPOINT_DIR / f"{dir_name}.json"
+        if legacy_path.exists():
+            shutil.copy2(legacy_path, cp_path)
+            log.info(f"Migrated checkpoint from {legacy_path} to {cp_path}")
+
+    return cp_path
 
 
 def load_checkpoint(dir_name: str) -> dict:
-    """Load checkpoint data for a batch directory."""
+    """Load checkpoint data for a directory."""
     cp_file = _checkpoint_path(dir_name)
     if cp_file.exists():
         with open(cp_file, "r") as f:
@@ -198,7 +227,7 @@ def load_checkpoint(dir_name: str) -> dict:
 
 
 def save_checkpoint(dir_name: str, data: dict):
-    """Save checkpoint data for a batch directory."""
+    """Save checkpoint data for a directory."""
     cp_file = _checkpoint_path(dir_name)
     with open(cp_file, "w") as f:
         json.dump(data, f, indent=2)
@@ -716,6 +745,53 @@ def ocr_epic_id_targeted(cell_img: np.ndarray) -> Optional[str]:
     return None
 
 
+def _retry_epic_id_alt_preprocess(cell_img: np.ndarray) -> Optional[str]:
+    """Retry EPIC ID extraction with alternative preprocessing strategies.
+
+    Uses different binarization and sharpening approaches that may work
+    when the standard CLAHE + adaptive threshold pipeline fails.
+    """
+    h, w = cell_img.shape[:2]
+    config = "--psm 7 --oem 1 --dpi 300 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    # ROI: top portion where EPIC ID appears
+    rois = [
+        (0, int(h * 0.3), int(w * 0.4), w),
+        (0, int(h * 0.35), int(w * 0.3), w),
+    ]
+
+    for y1, y2, x1, x2 in rois:
+        roi = cell_img[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+
+        scale = 4
+        upscaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+
+        if len(upscaled.shape) == 3:
+            gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = upscaled
+
+        # Strategy 1: Otsu's threshold (better for high-contrast text)
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        text = pytesseract.image_to_string(otsu, lang="eng", config=config).strip()
+        epic_id = fix_epic_id(text)
+        if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
+            return epic_id
+
+        # Strategy 2: Sharpen + simple threshold (helps with faint text)
+        sharpen_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
+        _, sharp_thresh = cv2.threshold(sharpened, 140, 255, cv2.THRESH_BINARY)
+        text = pytesseract.image_to_string(sharp_thresh, lang="eng", config=config).strip()
+        epic_id = fix_epic_id(text)
+        if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
+            return epic_id
+
+    return None
+
+
 # ----- Text Parsing -----
 
 # Regex patterns with fuzzy label matching for OCR errors
@@ -1083,16 +1159,84 @@ def fix_epic_id(raw: str) -> str:
         result = result[:3] + "0" + result[3:]
 
     # P4-6: Fix 9-char IDs where a digit may have been dropped
-    # If we have [A-Z]{3}\d{6} after above fix failed, or [A-Z]{2}\d{7}, try fixes
+    # If we have [A-Z]{2}\d{7}, try to recover the missing first letter from known prefixes
     if len(result) == 9 and re.match(r"^[A-Z]{2}\d{7}$", result):
-        # Two-letter prefix: likely a dropped letter. Can't recover reliably, return as-is.
-        pass
+        two_letter = result[:2]
+        recovered = _recover_two_letter_prefix(two_letter)
+        if recovered:
+            result = recovered + result[2:]
 
     # P4-3: Accept any ^[A-Z]{3}\d{7}$ as valid EPIC ID.
     # Multi-constituency voters have diverse prefixes (WRC, YLJ, XKR, etc.)
     # so prefix-based correction is removed to avoid corrupting valid IDs.
 
     return result
+
+
+# Prefix frequency table: built up during processing to recover 2-letter EPIC prefixes
+_epic_prefix_counts: dict[str, int] = defaultdict(int)
+
+
+def _seed_prefix_table(output_dir: Path):
+    """Seed the EPIC prefix frequency table from existing output CSVs.
+
+    This ensures prefix recovery works even when re-processing a subset of pages,
+    by loading prefix data from previously extracted records.
+    """
+    if not output_dir.exists():
+        return
+    count = 0
+    for csv_file in output_dir.glob("*.csv"):
+        try:
+            with open(csv_file, encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    epic = row.get("EPIC ID", "").strip()
+                    if epic and re.match(r"^[A-Z]{3}\d{7}$", epic):
+                        _epic_prefix_counts[epic[:3]] += 1
+                        count += 1
+        except Exception:
+            continue
+    if count:
+        top = sorted(_epic_prefix_counts.items(), key=lambda x: -x[1])[:5]
+        top_str = ", ".join(f"{p}:{c}" for p, c in top)
+        log.info(f"Seeded EPIC prefix table from {count} existing records (top: {top_str})")
+
+
+def _track_epic_prefix(epic_id: str):
+    """Record a valid 3-letter EPIC prefix for later recovery of 2-letter ones."""
+    if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
+        _epic_prefix_counts[epic_id[:3]] += 1
+
+
+def _recover_two_letter_prefix(two_letter: str) -> Optional[str]:
+    """Try to recover a 3-letter prefix from a 2-letter one using known prefix frequencies.
+
+    E.g., if 'VJ' is seen and 'RVJ' has 2000 occurrences, return 'RVJ'.
+    Only returns a match if there's a single dominant candidate (>80% of matches).
+    """
+    if not _epic_prefix_counts:
+        return None
+
+    # Find all 3-letter prefixes that end with this 2-letter suffix
+    candidates = {p: c for p, c in _epic_prefix_counts.items() if p[1:] == two_letter}
+    if not candidates:
+        # Also try prefixes where the 2-letter is the first two chars (dropped last letter)
+        candidates = {p: c for p, c in _epic_prefix_counts.items() if p[:2] == two_letter}
+
+    if not candidates:
+        return None
+
+    total = sum(candidates.values())
+    best_prefix, best_count = max(candidates.items(), key=lambda x: x[1])
+
+    # Only recover if the best candidate is dominant (>80% of matching prefixes)
+    if best_count / total >= 0.8 and best_count >= 5:
+        log.info(f"Recovered 2-letter prefix '{two_letter}' → '{best_prefix}' "
+                 f"(confidence: {best_count}/{total})")
+        return best_prefix
+
+    return None
 
 
 def clean_name(name: str) -> str:
@@ -1668,6 +1812,15 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
             if targeted_epic:
                 record["epic_id"] = targeted_epic
 
+        # Enhanced retry: alternative preprocessing for still-missing EPIC IDs
+        if not record["epic_id"] or not re.match(r"^[A-Z]{3}\d{7}$", record["epic_id"]):
+            retry_epic = _retry_epic_id_alt_preprocess(cell_img)
+            if retry_epic:
+                record["epic_id"] = retry_epic
+
+        # Track valid EPIC prefixes for 2-letter prefix recovery
+        _track_epic_prefix(record.get("epic_id", ""))
+
         # Skip truly empty cells (no name and no EPIC ID found)
         if not record["name_english"] and not record["epic_id"]:
             continue
@@ -1857,14 +2010,14 @@ def _process_pair_worker(args: tuple) -> tuple[str, list[dict], list[str], str, 
 
 # ----- Directory Processing -----
 
-def process_directory(dir_name: str, workers: int = 4, validate_only: bool = False, limit: int = 0):
-    """Process all unprocessed pairs in a batch directory."""
-    directory = INPUT_DIR / dir_name
+def process_directory(dir_name: str, workers: int = 4, validate_only: bool = False, limit: int = 0, part_filter: set[int] = None):
+    """Process all unprocessed pairs in a directory."""
+    directory = INPUT_BASE / dir_name
     if not directory.exists():
         log.error(f"Directory not found: {directory}")
         return
 
-    output_dir = OUTPUT_DIR / dir_name
+    output_dir = OUTPUT_BASE / dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Discover pairs
@@ -1878,8 +2031,16 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
     checkpoint = load_checkpoint(dir_name)
     processed_set = set(checkpoint.get("processed", []))
 
+    # Seed EPIC prefix table from existing output CSVs for prefix recovery
+    _seed_prefix_table(output_dir)
+
     # Filter to unprocessed
     pending = [p for p in pairs if p["key"] not in processed_set]
+
+    # Filter by part number if specified
+    if part_filter:
+        pending = [p for p in pending if int(p["part_no"]) in part_filter]
+        log.info(f"Part filter: processing parts {sorted(part_filter)}")
 
     if validate_only:
         pending = pending[:1]
@@ -1894,6 +2055,7 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
         log.info("All pairs already processed!")
         return
 
+    start_time = datetime.now()
     total_records = 0
     total_warnings = 0
     total_files = 0
@@ -1997,8 +2159,47 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
     log.info(f"  Output: {output_dir}")
     log.info(f"{'=' * 40}")
 
+    # Write run summary JSON
+    _write_run_summary(dir_name, start_time, len(pairs), total_files,
+                       total_records, total_warnings, error_count)
+
 
 # ----- Main -----
+
+def discover_ac_dirs() -> list[str]:
+    """Find all AC-xxx directories under INPUT_BASE that have an english/ subdirectory."""
+    if not INPUT_BASE.exists():
+        return []
+    dirs = []
+    for d in sorted(INPUT_BASE.iterdir()):
+        if d.is_dir() and d.name.startswith("AC-") and (d / "english").exists():
+            dirs.append(d.name)
+    return dirs
+
+
+def _write_run_summary(dir_name: str, start_time: datetime, total_pairs: int,
+                       processed: int, total_records: int, warnings: int, errors: int):
+    """Write a JSON summary file for the run."""
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+    summary = {
+        "directory": dir_name,
+        "started": start_time.isoformat(),
+        "completed": end_time.isoformat(),
+        "duration_seconds": round(duration, 1),
+        "total_pairs": total_pairs,
+        "processed": processed,
+        "total_records": total_records,
+        "warnings": warnings,
+        "errors": errors,
+    }
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = start_time.strftime("%Y%m%d_%H%M%S")
+    summary_path = LOG_DIR / f"extract_{dir_name}_{ts}_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    log.info(f"Run summary saved to: {summary_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2006,11 +2207,11 @@ def main():
     )
     parser.add_argument(
         "directory", nargs="?",
-        help="Batch directory to process (e.g., AC-184-Part-1-50)"
+        help="Directory to process (e.g., AC-188 or legacy AC-184-Part-1-50)"
     )
     parser.add_argument(
         "--all", action="store_true",
-        help="Process all batch directories sequentially"
+        help="Process all discovered AC directories sequentially"
     )
     parser.add_argument(
         "--validate", action="store_true",
@@ -2032,39 +2233,70 @@ def main():
         "--limit", type=int, default=0,
         help="Max number of pairs to process (default: 0 = all)"
     )
+    parser.add_argument(
+        "--part", type=str, default=None,
+        help="Part number or range to process (e.g., --part 101 or --part 50-100)"
+    )
     args = parser.parse_args()
-
-    setup_logging(OCR_DIR / "extraction.log")
 
     # Verify Tesseract is available
     if pytesseract is None:
-        log.error("pytesseract not installed. Run: pip install pytesseract")
+        print("ERROR: pytesseract not installed. Run: pip install pytesseract")
         sys.exit(1)
 
     try:
         pytesseract.get_tesseract_version()
     except Exception:
-        log.error(
-            "Tesseract OCR not found. Install it:\n"
+        print(
+            "ERROR: Tesseract OCR not found. Install it:\n"
             "  winget install UB-Mannheim.TesseractOCR\n"
             "  Then add to PATH and install Tamil language data."
         )
         sys.exit(1)
 
-    if not args.directory and not args.all:
-        parser.error("Specify a directory or use --all")
+    # Determine directories to process
+    if args.all:
+        dirs_to_process = discover_ac_dirs()
+        if not dirs_to_process:
+            print(f"No AC directories found in {INPUT_BASE}")
+            sys.exit(1)
+    elif args.directory:
+        dirs_to_process = [args.directory]
+    else:
+        # Interactive prompt
+        available = discover_ac_dirs()
+        if available:
+            print(f"\nAvailable directories in {INPUT_BASE}:")
+            for d in available:
+                print(f"  {d}")
+            print()
+        dir_name = input("Please enter the Assembly Constituency directory (e.g., AC-188): ").strip()
+        if not dir_name:
+            print("No directory specified.")
+            sys.exit(1)
+        dirs_to_process = [dir_name]
 
-    dirs_to_process = BATCH_DIRS if args.all else [args.directory]
+    # Setup per-run log file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_label = dirs_to_process[0] if len(dirs_to_process) == 1 else "all"
+    log_file = LOG_DIR / f"extract_{dir_label}_{timestamp}.log"
+    setup_logging(log_file)
 
     for dir_name in dirs_to_process:
-        directory = INPUT_DIR / dir_name
+        directory = INPUT_BASE / dir_name
+
+        # Parse --part filter
+        part_filter = parse_part_range(args.part) if args.part else None
 
         if args.dry_run:
             pairs = discover_pairs(directory)
             checkpoint = load_checkpoint(dir_name)
             processed_set = set(checkpoint.get("processed", []))
             pending = [p for p in pairs if p["key"] not in processed_set]
-            print(f"\n{dir_name}: {len(pairs)} total, {len(pending)} pending")
+            if part_filter:
+                pending = [p for p in pending if int(p["part_no"]) in part_filter]
+            print(f"\n{dir_name}: {len(pairs)} total, {len(pending)} pending"
+                  + (f" (parts: {sorted(part_filter)})" if part_filter else ""))
             for p in pending[:10]:
                 print(f"  ENG: {os.path.basename(p['english_path'])}")
                 tam_count = len(p.get("tamil_pages", {}))
@@ -2077,15 +2309,63 @@ def main():
 
         if args.reset:
             cp_file = _checkpoint_path(dir_name)
-            response = input(f"Reset checkpoint for {dir_name}? (y/N): ")
-            if response.lower() == "y":
-                if cp_file.exists():
-                    cp_file.unlink()
-                output_dir = OUTPUT_DIR / dir_name
-                if output_dir.exists():
-                    for f in output_dir.glob("*.csv"):
-                        f.unlink()
-                log.info(f"Reset complete for {dir_name}")
+            merged_dir = MERGED_BASE / dir_name
+            if part_filter:
+                # Reset only specific parts
+                part_labels = sorted(part_filter)
+                response = input(f"Reset parts {part_labels} for {dir_name}? (y/N): ")
+                if response.lower() == "y":
+                    checkpoint = load_checkpoint(dir_name)
+                    old_count = len(checkpoint.get("processed", []))
+                    checkpoint["processed"] = [
+                        k for k in checkpoint.get("processed", [])
+                        if not any(f"ENG-{p}-" in k for p in part_labels)
+                    ]
+                    removed = old_count - len(checkpoint["processed"])
+                    save_checkpoint(dir_name, checkpoint)
+                    # Remove page-level output CSVs for these parts
+                    output_dir = OUTPUT_BASE / dir_name
+                    if output_dir.exists():
+                        for p in part_labels:
+                            for f in output_dir.glob(f"*ENG-{p}-*.csv"):
+                                f.unlink()
+                    # Remove merged CSVs and update merge checkpoint
+                    if merged_dir.exists():
+                        merge_cp_path = merged_dir / "merge_checkpoint.json"
+                        merge_cp = {}
+                        if merge_cp_path.exists():
+                            with open(merge_cp_path) as f:
+                                merge_cp = json.load(f)
+                        for p in part_labels:
+                            for f in merged_dir.glob(f"*ENG-{p}-*.csv"):
+                                f.unlink()
+                            # Remove from merge checkpoint
+                            if "merged_parts" in merge_cp:
+                                merge_cp["merged_parts"] = [
+                                    m for m in merge_cp["merged_parts"]
+                                    if f"ENG-{p}-" not in m
+                                ]
+                        if merge_cp:
+                            with open(merge_cp_path, "w") as f:
+                                json.dump(merge_cp, f, indent=2)
+                    log.info(f"Reset {removed} entries for parts {part_labels} in {dir_name} (incl. merged)")
+            else:
+                response = input(f"Reset checkpoint for {dir_name}? (y/N): ")
+                if response.lower() == "y":
+                    if cp_file.exists():
+                        cp_file.unlink()
+                    output_dir = OUTPUT_BASE / dir_name
+                    if output_dir.exists():
+                        for f in output_dir.glob("*.csv"):
+                            f.unlink()
+                    # Also reset merged output
+                    if merged_dir.exists():
+                        for f in merged_dir.glob("*.csv"):
+                            f.unlink()
+                        merge_cp = merged_dir / "merge_checkpoint.json"
+                        if merge_cp.exists():
+                            merge_cp.unlink()
+                    log.info(f"Reset complete for {dir_name} (incl. merged)")
             continue
 
         log.info(f"\n{'=' * 50}")
@@ -2097,6 +2377,7 @@ def main():
             workers=args.workers,
             validate_only=args.validate,
             limit=args.limit,
+            part_filter=part_filter,
         )
 
 
