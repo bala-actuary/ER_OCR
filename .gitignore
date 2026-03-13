@@ -31,3 +31,10 @@ Thumbs.db
 
 # Working docs
 PLAN-*.md
+SETUP.md
+RUN-INSTRUCTIONS.md
+
+# Old/utility scripts
+split_file_script_old/
+analyze_quality.py
+analysze_scv_quality.py

@@ -18,11 +18,12 @@ PDF → PyMuPDF (extract image) → OpenCV (detect grid, crop cells)
 | Image preprocessing | OpenCV (CLAHE, denoising, adaptive threshold) |
 | OCR | Tesseract 5.4+ via `pytesseract` (PSM 6, OEM 1, 4x upscale) |
 | Field parsing | Python `re` with fuzzy label matching |
-| Tamil matching | EPIC ID + serial number comparison |
+| Tamil matching | EPIC ID + serial number + position-based fallback |
 
 ## Key File
 
-- `extract_ocr.py` — Single-file script containing all logic (~1500 lines)
+- `extract_ocr.py` — Single-file script containing all logic (~2100 lines)
+- `analyze_quality.py` — Quality analysis script for validating extraction accuracy
 
 ## Input/Output
 
@@ -54,11 +55,11 @@ Detection: `is_summary_or_legend_page()` checks OCR text for these markers.
 ## Extraction Rules
 
 From ENGLISH PDF: serial_no, epic_id, name_english, relation_name_english, relation_type, house_no, age, gender
-From TAMIL PDF (matched by EPIC ID or serial number): name_tamil, relation_name_tamil
+From TAMIL PDF (matched by EPIC ID, serial number, or cell position): name_tamil, relation_name_tamil
 
 ## Validation Rules
 
-- EPIC ID: 3 uppercase letters + 7 digits (known prefixes: RVJ, MDJ, IOD, JOD)
+- EPIC ID: 3 uppercase letters + 7 digits (any prefix accepted)
 - Age: 18-120 range
 - Gender: "Male" or "Female"
 - Max 30 records per page (3 columns x 10 rows)
@@ -81,3 +82,4 @@ bash check-progress.sh                                    # Monitor progress
 - **One output CSV per input English PDF** — enables 1:1 input/output traceability
 - **Checkpoint per directory** — supports parallel sessions on different directories
 - **Grid detection uses multi-scale + fallback chain**: morphological → Hough lines → contours → proportional
+- **Column collapse guard**: if detected columns span <85% of page width, falls back to proportional `[2%, 34%, 66%, 98%]`

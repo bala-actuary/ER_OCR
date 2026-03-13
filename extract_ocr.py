@@ -322,6 +322,14 @@ def detect_grid(image: np.ndarray) -> list[tuple[int, int, int, int]]:
     # Validate: electoral rolls always have 3 data columns (4 boundaries)
     col_boundaries = _enforce_three_columns(col_boundaries, w)
 
+    # P4-1: Sanity check — if detected boundaries don't span at least 85% of page
+    # width, the column detection collapsed (common on partial pages with <10 voters).
+    # Fall back to proportional columns.
+    col_span = col_boundaries[-1] - col_boundaries[0]
+    if col_span < w * 0.85:
+        log.info(f"Column boundaries span only {col_span/w:.0%} of page width — using proportional fallback")
+        col_boundaries = [int(w * 0.02), int(w * 0.34), int(w * 0.66), int(w * 0.98)]
+
     # Build cell list
     cells = []
     for row_idx in range(len(h_groups) - 1):
@@ -1036,32 +1044,36 @@ def parse_tamil_text(text: str) -> dict:
     return result
 
 
-# Known valid EPIC ID prefixes for AC 184
-KNOWN_EPIC_PREFIXES = {"RVJ", "MDJ", "IOD", "JOD"}
-
-
 def fix_epic_id(raw: str) -> str:
     """Post-process EPIC ID: fix common OCR errors like O→0 in digit positions."""
     # Remove spaces within EPIC ID (OCR sometimes adds them)
     raw = raw.replace(" ", "").strip()
-    if len(raw) < 10:
+
+    # P4-6: Uppercase the entire string first — OCR sometimes outputs lowercase
+    raw = raw.upper()
+
+    # Strip leading/trailing non-alphanumeric noise (e.g., "|RVJ1234567|")
+    raw = re.sub(r"^[^A-Z0-9]+", "", raw)
+    raw = re.sub(r"[^A-Z0-9]+$", "", raw)
+
+    if len(raw) < 9:
         return raw
 
     # Take first 10 chars
     raw = raw[:10]
 
     # Fix digit positions (3-9): letters → digits
-    digit_fixes = {"O": "0", "I": "1", "l": "1", "S": "5", "B": "8",
-                   "G": "6", "Z": "2", "D": "0", "T": "7", "q": "9"}
+    digit_fixes = {"O": "0", "I": "1", "L": "1", "S": "5", "B": "8",
+                   "G": "6", "Z": "2", "D": "0", "T": "7", "Q": "9"}
     chars = list(raw)
-    for i in range(3, 10):
-        if i < len(chars) and chars[i] in digit_fixes:
+    for i in range(3, min(10, len(chars))):
+        if chars[i] in digit_fixes:
             chars[i] = digit_fixes[chars[i]]
 
     # Fix letter positions (0-2): digits → letters
     letter_fixes = {"0": "O", "1": "I", "5": "S", "8": "B", "6": "G"}
-    for i in range(3):
-        if i < len(chars) and chars[i] in letter_fixes:
+    for i in range(min(3, len(chars))):
+        if chars[i] in letter_fixes:
             chars[i] = letter_fixes[chars[i]]
 
     result = "".join(chars)
@@ -1070,18 +1082,15 @@ def fix_epic_id(raw: str) -> str:
     if re.match(r"^[A-Z]{3}\d{6}$", result):
         result = result[:3] + "0" + result[3:]
 
-    # Try to correct prefix using known valid prefixes (Levenshtein distance 1)
-    prefix = result[:3]
-    if prefix not in KNOWN_EPIC_PREFIXES:
-        best_match = None
-        best_dist = 2  # Only correct if distance <= 1
-        for known in KNOWN_EPIC_PREFIXES:
-            dist = sum(a != b for a, b in zip(prefix, known))
-            if dist < best_dist:
-                best_dist = dist
-                best_match = known
-        if best_match:
-            result = best_match + result[3:]
+    # P4-6: Fix 9-char IDs where a digit may have been dropped
+    # If we have [A-Z]{3}\d{6} after above fix failed, or [A-Z]{2}\d{7}, try fixes
+    if len(result) == 9 and re.match(r"^[A-Z]{2}\d{7}$", result):
+        # Two-letter prefix: likely a dropped letter. Can't recover reliably, return as-is.
+        pass
+
+    # P4-3: Accept any ^[A-Z]{3}\d{7}$ as valid EPIC ID.
+    # Multi-constituency voters have diverse prefixes (WRC, YLJ, XKR, etc.)
+    # so prefix-based correction is removed to avoid corrupting valid IDs.
 
     return result
 
@@ -1093,6 +1102,10 @@ def clean_name(name: str) -> str:
     hyphens, and apostrophes are valid in names. Everything else is stripped.
     Uses unicodedata to distinguish real letters from symbols like «, ¢, °, ©.
     """
+    # P4-5: Normalize accented characters to ASCII equivalents (e.g., é → e).
+    # Tesseract sometimes produces accented chars as encoding artifacts.
+    name = unicodedata.normalize("NFD", name)
+    name = "".join(ch for ch in name if unicodedata.category(ch) != "Mn" or "\u0B80" <= ch <= "\u0BFF")
     # Strip "Name:" prefix that leaks from relation label splitting
     name = re.sub(r"^(?:Name|Nama|Nane|Narne)\s*[:.|\-]?\s*", "", name, flags=re.IGNORECASE)
     # Whitelist: keep only characters that are Unicode letters (category L*),
@@ -1171,6 +1184,11 @@ def clean_house_no(raw: str) -> str:
         raw = raw.replace("(", "")
     if ")" in raw and "(" not in raw:
         raw = raw.replace(")", "")
+
+    # P4-4: Reject pure-digit house numbers > 4 chars — these are serial numbers
+    # bleeding into the house number field from grid parsing errors.
+    if re.match(r"^\d{5,}$", raw):
+        return ""
 
     # Step 5: Fix common OCR letter-for-digit confusion in leading position
     # House numbers start with digits. A leading single letter before digits/space
@@ -1732,6 +1750,12 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
             record["name_tamil"] = ""
         if "relation_name_tamil" not in record:
             record["relation_name_tamil"] = ""
+        # P4-2: Final ASCII contamination guard — ensure Tamil fields are clean
+        # regardless of which code path populated them.
+        if record["name_tamil"]:
+            record["name_tamil"] = _clean_tamil_text(record["name_tamil"])
+        if record["relation_name_tamil"]:
+            record["relation_name_tamil"] = _clean_tamil_text(record["relation_name_tamil"])
 
     return eng_records
 
