@@ -117,8 +117,11 @@ def load_merge_checkpoint(ac_dir: Path) -> dict:
     """Load merge checkpoint."""
     cp_path = ac_dir / "merge_checkpoint.json"
     if cp_path.exists():
-        with open(cp_path, "r") as f:
-            return json.load(f)
+        try:
+            with open(cp_path, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print(f"  WARNING: Corrupt checkpoint at {cp_path}, starting fresh")
     return {"merged_parts": [], "total_records": 0}
 
 
