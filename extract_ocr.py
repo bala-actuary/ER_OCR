@@ -676,7 +676,9 @@ GENDER_RE = re.compile(r"(?:Gender|Gend|Gerder)\s*[:.=|\-]?\s*(Male|Female|Ma\w*
 # Tamil patterns
 TAMIL_NAME_RE = re.compile(r"(?:பெயர்)\s*[:.\-]?\s*(.+?)(?:\s*-\s*)?$")
 TAMIL_RELATION_RE = re.compile(
-    r"(?:தந்தையின்|கணவரின்|கணவர்|தாயின்)\s*(?:பெயர்)?\s*[:.|\-]?\s*(.+?)(?:\s*-\s*)?$"
+    r"(?:தந்தையின்|கணவரின்|கணவர்|தாயின்|இதரர்"
+    r"|கட்தையின்|கற்தையின்|க்தையின்|சந்தையின்"  # OCR misreads of தந்தையின்
+    r")\s*(?:பெயர்)?\s*[:.|\-]?\s*(.+?)(?:\s*-\s*)?$"
 )
 # Tamil form label noise that can contaminate name fields
 TAMIL_LABEL_NOISE_RE = re.compile(
@@ -1346,8 +1348,13 @@ def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
         # Tamil OCR for names
         tam_data = ocr_cell_tamil(cell_img)
 
-        # EPIC ID extraction using English OCR on full cell
-        epic_id = _extract_epic_from_cell(cell_img)
+        # EPIC ID extraction: targeted ROI first, full-cell fallback for edge cases
+        epic_id = ocr_epic_id_targeted(cell_img)
+        if not epic_id or not re.match(r"^[A-Z]{3}\d{7}$", epic_id):
+            epic_id = _extract_epic_from_cell(cell_img)
+
+        # Serial number extraction using targeted top-left ROI (fallback matching)
+        serial_no = tam_data["serial_no"] or ocr_serial_targeted(cell_img)
 
         if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
             result_by_epic[epic_id] = {
@@ -1355,8 +1362,8 @@ def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
                 "relation_name_tamil": tam_data["relation_name_tamil"],
             }
 
-        if tam_data["serial_no"]:
-            result_by_serial[tam_data["serial_no"]] = {
+        if serial_no:
+            result_by_serial[serial_no] = {
                 "name_tamil": tam_data["name_tamil"],
                 "relation_name_tamil": tam_data["relation_name_tamil"],
             }
@@ -1396,8 +1403,8 @@ def _check_tamil_page_match(tam_path: str, eng_epic_ids: set[str]) -> int:
         cell_img = tam_img[y1:y2, x1:x2]
         if cell_img.size == 0:
             continue
-        epic = _extract_epic_from_cell(cell_img)
-        if epic in eng_epic_ids:
+        epic = ocr_epic_id_targeted(cell_img)
+        if epic and epic in eng_epic_ids:
             match_count += 1
         if match_count >= 3:
             return match_count  # Early exit: confirmed match
