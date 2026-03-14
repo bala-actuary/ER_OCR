@@ -5,8 +5,8 @@ Split Electoral Roll PDFs into individual page files.
 Reads original multi-page PDFs from Input/ER_Downloads/AC-xxx/{english,tamil}/
 and splits them into single-page PDFs in Input/split_files/AC-xxx/{english,tamil}/.
 
-English PDFs: first 2 pages (metadata) are skipped.
-Tamil PDFs:   first 3 pages (metadata) are skipped.
+All pages are split. Non-data pages (metadata, summary, map, legend) are
+auto-detected and skipped during extraction by extract_ocr.py.
 
 Usage:
     python split_pdfs.py                    # Interactive prompt for AC number
@@ -26,10 +26,11 @@ SCRIPT_DIR = Path(__file__).parent
 DOWNLOADS_DIR = SCRIPT_DIR / "Input" / "ER_Downloads"
 SPLIT_DIR = SCRIPT_DIR / "Input" / "split_files"
 
-# Pages to skip (0-based index): English skips first 2, Tamil skips first 3
+# Pages to skip: 0 means split all pages. Non-data pages are auto-detected
+# during extraction by extract_ocr.py (metadata, summary, map, legend pages).
 SKIP_PAGES = {
-    "english": 2,
-    "tamil": 3,
+    "english": 0,
+    "tamil": 0,
 }
 
 
@@ -165,7 +166,8 @@ def main():
         output_folder = output_base / language
 
         pdf_count = len(glob.glob(str(input_folder / "**" / "*.pdf"), recursive=True))
-        print(f"[{language.upper()}] Found {pdf_count} PDF(s), skipping first {skip_count} page(s) each...")
+        skip_msg = f", skipping first {skip_count} page(s) each" if skip_count > 0 else ""
+        print(f"[{language.upper()}] Found {pdf_count} PDF(s){skip_msg}, splitting all pages...")
 
         stats = split_pdfs_for_language(
             input_folder, output_folder, skip_count, language, force=args.force

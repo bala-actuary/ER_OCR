@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo   Electoral Roll OCR - Setup (v1.0)
+echo   Electoral Roll OCR - Setup (v1.1)
 echo ============================================
 echo.
 
@@ -21,13 +21,18 @@ if errorlevel 1 (
         echo [OK] Tesseract found at C:\Program Files\Tesseract-OCR\
     ) else (
         echo.
-        echo Tesseract OCR not found. Installing via winget...
+        echo Tesseract OCR not found. Attempting install via winget...
+        echo (If winget is not available on your system, this step will fail - that's OK^)
+        echo.
         winget install UB-Mannheim.TesseractOCR
         if errorlevel 1 (
             echo.
-            echo WARNING: winget install failed. Please install Tesseract manually:
-            echo   https://github.com/UB-Mannheim/tesseract/wiki
-            echo   Install to: C:\Program Files\Tesseract-OCR\
+            echo NOTE: Automatic install failed (winget may not be available on your system^).
+            echo Please install Tesseract manually:
+            echo   1. Download from: https://github.com/UB-Mannheim/tesseract/wiki
+            echo   2. Run the installer (install to: C:\Program Files\Tesseract-OCR\^)
+            echo   3. During installation, check "Additional language data" for Tamil support
+            echo   4. Re-run this setup.bat after installing Tesseract
         )
     )
 ) else (

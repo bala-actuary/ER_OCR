@@ -31,7 +31,7 @@ import shutil
 import sys
 import traceback
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -578,13 +578,113 @@ def _fallback_grid(h: int, w: int) -> list[tuple[int, int, int, int]]:
     return cells
 
 
+# ----- Cell Content Detection -----
+
+def _is_cell_empty(cell_img: np.ndarray, threshold: float = 0.02) -> bool:
+    """
+    Check if a cell image is effectively empty (no voter data) by analyzing ink density.
+    Real voter cells have 5-10%+ ink coverage; empty cells have <1%.
+    Crops out border 5% to exclude grid lines before measuring.
+    """
+    h, w = cell_img.shape[:2]
+    if h < 10 or w < 10:
+        return True
+
+    # Convert to grayscale
+    if len(cell_img.shape) == 3:
+        gray = cv2.cvtColor(cell_img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = cell_img
+
+    # Binary threshold (same as grid detection)
+    _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+
+    # Crop out border 5% on each side to exclude grid lines
+    border_y = max(int(h * 0.05), 2)
+    border_x = max(int(w * 0.05), 2)
+    interior = binary[border_y:h - border_y, border_x:w - border_x]
+
+    if interior.size == 0:
+        return True
+
+    dark_pixels = np.count_nonzero(interior)
+    total_pixels = interior.size
+    ink_ratio = dark_pixels / total_pixels
+
+    # Absolute minimum: fewer than 200 dark pixels means no readable text
+    if dark_pixels < 200:
+        log.debug(f"Empty cell: dark_pixels={dark_pixels}, ink_ratio={ink_ratio:.4f}")
+        return True
+
+    if ink_ratio < threshold:
+        log.debug(f"Empty cell: ink_ratio={ink_ratio:.4f} < {threshold}")
+        return True
+
+    return False
+
+
+def _is_record_valid(record: dict) -> bool:
+    """
+    Check if an OCR'd record has enough valid signals to be real voter data.
+    A real voter entry always has 3+ valid fields; noise from empty cells rarely
+    produces 2+ valid signals simultaneously.
+    """
+    signals = 0
+    if record.get("name_english") and len(record["name_english"]) >= 3:
+        signals += 1
+    if record.get("epic_id") and re.match(r"^[A-Z]{3}\d{7}$", record["epic_id"]):
+        signals += 1
+    if record.get("serial_no"):
+        signals += 1
+    if record.get("age") and record.get("gender"):
+        signals += 1
+    if record.get("house_no"):
+        signals += 1
+    return signals >= 2
+
+
+def _trim_trailing_empty_rows(records: list[dict], num_cols: int = 3) -> list[dict]:
+    """
+    Remove records from trailing rows where no cell passed validation.
+    Prevents noise from bottom empty rows from entering serial inference.
+    Records must have '_cell_index' set.
+    """
+    if not records or num_cols < 1:
+        return records
+
+    max_cell = max(r.get("_cell_index", 0) for r in records)
+    num_rows = (max_cell // num_cols) + 1
+
+    # Find the last row that has at least one valid record
+    last_valid_row = -1
+    for row in range(num_rows - 1, -1, -1):
+        row_start = row * num_cols
+        row_end = row_start + num_cols
+        row_records = [r for r in records if row_start <= r.get("_cell_index", -1) < row_end]
+        if any(_is_record_valid(r) for r in row_records):
+            last_valid_row = row
+            break
+
+    if last_valid_row < 0:
+        return records
+
+    # Keep records up to and including last_valid_row
+    cutoff = (last_valid_row + 1) * num_cols
+    trimmed = [r for r in records if r.get("_cell_index", 0) < cutoff]
+
+    if len(trimmed) < len(records):
+        log.info(f"Trimmed {len(records) - len(trimmed)} records from trailing empty rows")
+
+    return trimmed
+
+
 # ----- OCR -----
 
 def ocr_serial_targeted(cell_img: np.ndarray) -> str:
     """
     Targeted serial number extraction from the top-left corner of a cell.
     Serial numbers appear in a small bordered box at the top-left.
-    Uses character whitelist for digits only.
+    Uses multi-strategy preprocessing with voting for accuracy.
     """
     h, w = cell_img.shape[:2]
     # Serial number box is in the top-left ~25% height, ~20% width of the cell
@@ -598,17 +698,43 @@ def ocr_serial_targeted(cell_img: np.ndarray) -> str:
     else:
         gray = upscaled
 
-    # Use fixed threshold for the small serial box (adaptive can over-segment small regions)
-    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-
     config = "--psm 7 --oem 1 --dpi 300 -c tessedit_char_whitelist=0123456789#"
-    text = pytesseract.image_to_string(thresh, lang="eng", config=config).strip()
 
-    # Extract digits
+    # Multi-strategy: try different thresholds and pick by voting
+    candidates = []
+
+    # Strategy 1: Fixed threshold at 150 (original)
+    _, thresh1 = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    text = pytesseract.image_to_string(thresh1, lang="eng", config=config).strip()
     m = re.search(r"(\d{1,4})", text)
     if m:
-        return m.group(1)
-    return ""
+        candidates.append(m.group(1))
+
+    # Strategy 2: Otsu's threshold
+    _, thresh2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    text = pytesseract.image_to_string(thresh2, lang="eng", config=config).strip()
+    m = re.search(r"(\d{1,4})", text)
+    if m:
+        candidates.append(m.group(1))
+
+    # Strategy 3: Lower threshold (120) for faint text
+    _, thresh3 = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
+    text = pytesseract.image_to_string(thresh3, lang="eng", config=config).strip()
+    m = re.search(r"(\d{1,4})", text)
+    if m:
+        candidates.append(m.group(1))
+
+    if not candidates:
+        return ""
+
+    # Voting: if 2+ strategies agree, use that; otherwise use first result
+    counts = Counter(candidates)
+    best, count = counts.most_common(1)[0]
+    if count >= 2:
+        return best
+
+    # No consensus — return the first candidate
+    return candidates[0]
 
 
 def _extract_age_gender_targeted(cell_img: np.ndarray, record: dict) -> None:
@@ -684,12 +810,11 @@ def ocr_cell_english(cell_img: np.ndarray) -> dict:
     return parse_english_text(text)
 
 
-def ocr_cell_tamil(cell_img: np.ndarray) -> dict:
-    """OCR a single cell from the Tamil PDF and extract Tamil names."""
+def _ocr_tamil_with_preprocessing(cell_img: np.ndarray, crop_ratio: float,
+                                    use_otsu: bool = False) -> dict:
+    """OCR a Tamil cell with specified crop ratio and preprocessing strategy."""
     h, w = cell_img.shape[:2]
-    # Crop out bottom 15% to avoid age/gender/house labels contaminating name extraction
-    # (reduced from 20% — Tamil names sometimes extend further down)
-    cropped = cell_img[0:int(h * 0.85), :]
+    cropped = cell_img[0:int(h * crop_ratio), :]
 
     scale = 4
     upscaled = cv2.resize(cropped, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
@@ -699,11 +824,49 @@ def ocr_cell_tamil(cell_img: np.ndarray) -> dict:
     else:
         gray = upscaled
 
-    thresh = preprocess_for_ocr(gray)
+    if use_otsu:
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        thresh = preprocess_for_ocr(gray)
 
     text = pytesseract.image_to_string(thresh, lang="tam+eng", config="--psm 6 --oem 1 --dpi 300")
-
     return parse_tamil_text(text)
+
+
+def ocr_cell_tamil(cell_img: np.ndarray) -> dict:
+    """OCR a single cell from the Tamil PDF and extract Tamil names.
+    Retries with alternative preprocessing if initial result has poor Tamil names."""
+    # Primary attempt: crop bottom 15%, CLAHE preprocessing
+    result = _ocr_tamil_with_preprocessing(cell_img, crop_ratio=0.85)
+
+    # If name is valid, return immediately (no retry needed)
+    if _is_valid_tamil_name(result.get("name_tamil", "")):
+        return result
+
+    # Retry with less aggressive crops and alternative preprocessing
+    best = result
+    best_count = _count_tamil_chars(result.get("name_tamil", ""))
+
+    retry_configs = [
+        (0.90, False),  # Less crop, same preprocessing
+        (0.95, False),  # Minimal crop, same preprocessing
+        (0.85, True),   # Same crop, Otsu threshold
+        (0.90, True),   # Less crop, Otsu threshold
+    ]
+
+    for crop_ratio, use_otsu in retry_configs:
+        attempt = _ocr_tamil_with_preprocessing(cell_img, crop_ratio, use_otsu)
+        name = attempt.get("name_tamil", "")
+        if _is_valid_tamil_name(name):
+            count = _count_tamil_chars(name)
+            if count > best_count:
+                best = attempt
+                best_count = count
+            # If we got a good result, no need to try more
+            if best_count >= 3:
+                break
+
+    return best
 
 
 def ocr_epic_id_targeted(cell_img: np.ndarray) -> Optional[str]:
@@ -792,6 +955,83 @@ def _retry_epic_id_alt_preprocess(cell_img: np.ndarray) -> Optional[str]:
     return None
 
 
+def _ocr_epic_id_with_confidence(cell_img: np.ndarray) -> tuple[str, float]:
+    """
+    Multi-strategy EPIC ID extraction with confidence scoring.
+    Runs all preprocessing strategies and uses voting/confidence to pick the best.
+    Returns (epic_id, confidence) where confidence is 0-100.
+    """
+    h, w = cell_img.shape[:2]
+    config = "--psm 7 --oem 1 --dpi 300 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    # Primary ROI: top-right area where EPIC ID appears
+    roi = cell_img[0:int(h * 0.35), int(w * 0.3):w]
+    if roi.size == 0:
+        return ("", 0.0)
+
+    scale = 4
+    upscaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+    if len(upscaled.shape) == 3:
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = upscaled
+
+    # Three preprocessing strategies
+    strategies = {}
+
+    # Strategy 1: CLAHE + adaptive threshold (default)
+    thresh1 = preprocess_for_ocr(gray)
+    strategies["clahe"] = thresh1
+
+    # Strategy 2: Otsu's threshold
+    _, thresh2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    strategies["otsu"] = thresh2
+
+    # Strategy 3: Sharpen + simple threshold
+    sharpen_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+    sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
+    _, thresh3 = cv2.threshold(sharpened, 140, 255, cv2.THRESH_BINARY)
+    strategies["sharpen"] = thresh3
+
+    candidates = []  # list of (epic_id, confidence)
+
+    for name, thresh in strategies.items():
+        try:
+            data = pytesseract.image_to_data(thresh, lang="eng", config=config,
+                                              output_type=pytesseract.Output.DICT)
+            words = []
+            confidences = []
+            for j, text_word in enumerate(data["text"]):
+                text_word = text_word.strip()
+                if text_word and int(data["conf"][j]) > 0:
+                    words.append(text_word)
+                    confidences.append(int(data["conf"][j]))
+
+            full_text = "".join(words)
+            epic_id = fix_epic_id(full_text)
+            if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
+                avg_conf = sum(confidences) / len(confidences) if confidences else 0
+                candidates.append((epic_id, avg_conf))
+        except Exception:
+            continue
+
+    if not candidates:
+        return ("", 0.0)
+
+    # If multiple strategies agree on the same EPIC, boost confidence
+    epic_counts = Counter(epic for epic, _ in candidates)
+    most_common_epic, count = epic_counts.most_common(1)[0]
+
+    if count >= 2:
+        # Consensus: 2+ strategies agree — high confidence
+        best_conf = max(conf for epic, conf in candidates if epic == most_common_epic)
+        return (most_common_epic, min(best_conf + 10, 100))
+    else:
+        # No consensus: return highest confidence candidate
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0]
+
+
 # ----- Text Parsing -----
 
 # Regex patterns with fuzzy label matching for OCR errors
@@ -833,7 +1073,35 @@ TAMIL_LABEL_NOISE_RE = re.compile(
     r"|வயது\s*[:：]\s*\d+"                      # "வயது : 28" = Age label
     r"|வீட்டு\s*எண்"                            # "வீட்டு எண்" = House Number label
     r"|புகைப்படம்"                               # "புகைப்படம்" = Photo label
+    r"|கையொப்பம்"                               # "கையொப்பம்" = Signature label
 )
+
+# Tamil words that should never appear as standalone names
+TAMIL_GENDER_LABELS = {"ஆண்", "பெண்", "ஆண", "பெண"}
+TAMIL_NOISE_WORDS = {
+    "வயது", "வீட்டு", "எண்", "புகைப்படம்", "பாலினம்",
+    "கையொப்பம்", "available", "photo",
+}
+
+
+def _count_tamil_chars(text: str) -> int:
+    """Count the number of Tamil Unicode characters in text."""
+    return sum(1 for c in text if '\u0B80' <= c <= '\u0BFF')
+
+
+def _is_valid_tamil_name(text: str) -> bool:
+    """
+    Validate a Tamil name: must have at least 3 Tamil characters and not be
+    a gender label or other noise word.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if stripped in TAMIL_GENDER_LABELS or stripped in TAMIL_NOISE_WORDS:
+        return False
+    if _count_tamil_chars(stripped) < 3:
+        return False
+    return True
 
 
 def parse_english_text(text: str) -> dict:
@@ -1051,18 +1319,26 @@ def parse_tamil_text(text: str) -> dict:
         l_lower = line.lower()
         if any(skip in l_lower for skip in ["available", "photo"]):
             continue
+        # Skip lines that are just gender labels (bare "ஆண்" or "பெண்")
+        stripped = line.strip()
+        if stripped in TAMIL_GENDER_LABELS or stripped in TAMIL_NOISE_WORDS:
+            continue
 
         # Tamil name: line containing பெயர் (name) but NOT தந்தையின்/கணவரின்/தாயின் (relation)
         name_match = TAMIL_NAME_RE.search(line)
         if name_match and not result["name_tamil"]:
             if not TAMIL_RELATION_RE.search(line):
-                result["name_tamil"] = _clean_tamil_text(name_match.group(1))
+                candidate = _clean_tamil_text(name_match.group(1))
+                if _is_valid_tamil_name(candidate):
+                    result["name_tamil"] = candidate
                 continue
 
         # Tamil relation name
         rel_match = TAMIL_RELATION_RE.search(line)
         if rel_match:
-            result["relation_name_tamil"] = _clean_tamil_text(rel_match.group(1))
+            candidate = _clean_tamil_text(rel_match.group(1))
+            if _is_valid_tamil_name(candidate):
+                result["relation_name_tamil"] = candidate
             continue
 
     # Fallback for relation name: if name was found but relation regex failed,
@@ -1084,14 +1360,14 @@ def parse_tamil_text(text: str) -> dict:
             rel_fallback = re.search(r"பெயர்\s*[:.\-]?\s*(.+?)(?:\s*-\s*)?$", line)
             if rel_fallback:
                 value = _clean_tamil_text(rel_fallback.group(1))
-                if value and any("\u0B80" <= c <= "\u0BFF" for c in value):
+                if _is_valid_tamil_name(value):
                     result["relation_name_tamil"] = value
                     break
             # Also try colon-separated value on lines with Tamil text
             colon_match = re.search(r"[:：]\s*(.+?)(?:\s*-\s*)?$", line)
             if colon_match:
                 value = _clean_tamil_text(colon_match.group(1))
-                if value and any("\u0B80" <= c <= "\u0BFF" for c in value):
+                if _is_valid_tamil_name(value):
                     result["relation_name_tamil"] = value
                     break
 
@@ -1101,21 +1377,20 @@ def parse_tamil_text(text: str) -> dict:
         for line in lines[1:]:
             if any(skip in line.lower() for skip in ["available", "photo"]):
                 continue
+            stripped = line.strip()
+            if stripped in TAMIL_GENDER_LABELS or stripped in TAMIL_NOISE_WORDS:
+                continue
             # Look for lines with Tamil characters and colon separator
             colon_match = re.search(r"[:：]\s*(.+?)(?:\s*-\s*)?$", line)
             if colon_match:
                 value = _clean_tamil_text(colon_match.group(1))
-                # Check if it has Tamil chars (Unicode range 0B80-0BFF)
-                if any("\u0B80" <= c <= "\u0BFF" for c in value):
+                # Remove label prefix like "பெயர்" if present
+                value = re.sub(r"^.*பெயர்\s*[:：]?\s*", "", value).strip()
+                if _is_valid_tamil_name(value):
                     if not result["name_tamil"]:
-                        # Remove label prefix like "பெயர்" if present
-                        value = re.sub(r"^.*பெயர்\s*[:：]?\s*", "", value).strip()
-                        if value:
-                            result["name_tamil"] = value
+                        result["name_tamil"] = value
                     elif not result["relation_name_tamil"]:
-                        value = re.sub(r"^.*பெயர்\s*[:：]?\s*", "", value).strip()
-                        if value:
-                            result["relation_name_tamil"] = value
+                        result["relation_name_tamil"] = value
 
     return result
 
@@ -1522,10 +1797,38 @@ def _filter_stray_records(records: list[dict]) -> list[dict]:
         return records
 
     sorted_serials = sorted(serials)
-    median_serial = sorted_serials[len(sorted_serials) // 2]
-    # Determine the expected range from the majority of records
-    min_expected = median_serial - 35
-    max_expected = median_serial + 35
+
+    # Find the longest consecutive run to use as the anchor sequence.
+    # This is more robust than median — a single misread (e.g., 509→609) can
+    # poison inference to create a false majority (609,610,611,612) that outvotes
+    # the correct sequence (505,506,507,508).
+    best_run_start = sorted_serials[0]
+    best_run_len = 1
+    cur_start = sorted_serials[0]
+    cur_len = 1
+    for j in range(1, len(sorted_serials)):
+        if sorted_serials[j] == sorted_serials[j - 1] + 1:
+            cur_len += 1
+        else:
+            if cur_len > best_run_len:
+                best_run_start = cur_start
+                best_run_len = cur_len
+            cur_start = sorted_serials[j]
+            cur_len = 1
+    if cur_len > best_run_len:
+        best_run_start = cur_start
+        best_run_len = cur_len
+
+    # Use the midpoint of the longest run as anchor
+    anchor_serial = best_run_start + best_run_len // 2
+
+    # Dynamic tolerance: based on record count, centered on the anchor
+    tolerance = max(len(records) + 5, 20)
+    min_expected = anchor_serial - tolerance
+    max_expected = anchor_serial + tolerance
+
+    log.debug(f"Stray filter: anchor={anchor_serial} (run {best_run_start}-{best_run_start+best_run_len-1}, "
+              f"len={best_run_len}), tolerance=±{tolerance}")
 
     corrected_any = False
     for r in records:
@@ -1533,18 +1836,18 @@ def _filter_stray_records(records: list[dict]) -> list[dict]:
             s = int(r.get("serial_no", "0"))
             if s == 0:
                 continue
-            if abs(s - median_serial) > 35:
+            if abs(s - anchor_serial) > tolerance:
                 # Try digit-level correction: common OCR misreads
                 # e.g., 203 -> 253 (0 misread as 5), 205 -> 255
                 original = r["serial_no"]
                 corrected = _try_correct_serial(s, min_expected, max_expected)
                 if corrected is not None:
-                    log.info(f"Corrected stray serial {original} -> {corrected} (median: {median_serial})")
+                    log.info(f"Corrected stray serial {original} -> {corrected} (anchor: {anchor_serial})")
                     r["serial_no"] = str(corrected)
                     corrected_any = True
                 else:
                     # Can't correct — clear it so inference can fill it from neighbors
-                    log.info(f"Cleared stray serial {original} (too far from median {median_serial})")
+                    log.info(f"Cleared stray serial {original} (too far from anchor {anchor_serial})")
                     r["serial_no"] = ""
                     corrected_any = True
         except ValueError:
@@ -1590,18 +1893,48 @@ def _try_correct_serial(stray: int, min_expected: int, max_expected: int) -> Opt
     return None
 
 
-def is_summary_or_legend_page(text: str) -> bool:
-    """Check if OCR text indicates a summary or legend page (non-data)."""
+def is_non_data_page(text: str) -> bool:
+    """Check if OCR text indicates a non-data page (metadata, summary, map, legend, or signature)."""
     text_upper = text.upper()
+
+    # --- Summary pages ---
     if "SUMMARY OF ELECTORS" in text_upper:
         return True
     if "SUMMARY" in text_upper and "TOTAL" in text_upper:
         return True
-    # Tamil legend page
+
+    # --- Legend page (Tamil) ---
     if "E- Expired" in text or "S- Shifted" in text:
         return True
     if "Expired" in text and "Shifted" in text and "Repeated" in text:
         return True
+
+    # --- Metadata page (English) ---
+    if "ELECTORAL ROLL" in text_upper:
+        return True
+
+    # --- Metadata page (Tamil) ---
+    # Tamil header: "வாக்காளர் பட்டியல்" (Electoral Roll)
+    if "வாக்காளர்" in text and "பட்டியல்" in text:
+        return True
+
+    # --- Map/photos page ---
+    # Both English and Tamil map pages contain these English labels
+    if "NAZRI NAKSHA" in text_upper or "GOOGLE MAP VIEW" in text_upper:
+        return True
+    if "POLLING STATION BUILDING" in text_upper:
+        return True
+    if "KEY MAP VIEW" in text_upper and "CAD VIEW" in text_upper:
+        return True
+
+    # --- Signature-only page (Tamil) or near-blank page ---
+    stripped = text.strip()
+    if len(stripped) < 100 and "கையொப்பம்" in text:
+        return True
+    # Generic catch-all: page with very little text is not voter data
+    if len(stripped) < 50:
+        return True
+
     return False
 
 
@@ -1628,6 +1961,10 @@ def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
     for i, (x1, y1, x2, y2) in enumerate(tam_cells):
         cell_img = tam_img[y1:y2, x1:x2]
         if cell_img.size == 0:
+            continue
+
+        # Pre-OCR empty cell detection: skip cells with no meaningful ink
+        if _is_cell_empty(cell_img):
             continue
 
         # Tamil OCR for names
@@ -1778,7 +2115,7 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
     _, eng_thresh = cv2.threshold(eng_gray, 150, 255, cv2.THRESH_BINARY)
     full_text = pytesseract.image_to_string(eng_thresh, lang="eng", config="--psm 3")
 
-    if is_summary_or_legend_page(full_text):
+    if is_non_data_page(full_text):
         return []
 
     # Detect grid on English page
@@ -1794,16 +2131,26 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
         if cell_img.size == 0:
             continue
 
+        # Pre-OCR empty cell detection: skip cells with no meaningful ink
+        if _is_cell_empty(cell_img):
+            continue
+
         record = ocr_cell_english(cell_img)
 
         # Targeted age/gender extraction from bottom of cell when main OCR missed them
         if not record["age"] or not record["gender"]:
             _extract_age_gender_targeted(cell_img, record)
 
-        # Targeted serial number extraction from the top-left box
-        if not record["serial_no"]:
-            targeted_serial = ocr_serial_targeted(cell_img)
-            if targeted_serial:
+        # Targeted serial number extraction from the top-left box (multi-strategy)
+        # Always run to cross-validate the primary serial — catches digit misreads
+        targeted_serial = ocr_serial_targeted(cell_img)
+        if targeted_serial:
+            if not record["serial_no"]:
+                record["serial_no"] = targeted_serial
+            elif record["serial_no"] != targeted_serial:
+                # Primary and targeted disagree — prefer targeted (multi-strategy voted)
+                log.debug(f"Serial cross-validate: primary={record['serial_no']} "
+                          f"targeted={targeted_serial} — using targeted")
                 record["serial_no"] = targeted_serial
 
         # Try targeted EPIC ID extraction if regex didn't find a valid one
@@ -1818,15 +2165,41 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
             if retry_epic:
                 record["epic_id"] = retry_epic
 
+        # Confidence-scored EPIC: if we have an EPIC, verify with multi-strategy voting
+        # Only triggers when confidence may be low (helps catch digit misreads)
+        epic_confidence = 100.0  # Default high confidence for clean reads
+        if record["epic_id"] and re.match(r"^[A-Z]{3}\d{7}$", record["epic_id"]):
+            # Run confidence check to verify the EPIC we got
+            conf_epic, conf_score = _ocr_epic_id_with_confidence(cell_img)
+            if conf_epic:
+                epic_confidence = conf_score
+                if conf_epic != record["epic_id"] and conf_score >= 70:
+                    # Multi-strategy voting disagrees with initial read — prefer voted result
+                    log.debug(f"EPIC confidence override: {record['epic_id']} -> {conf_epic} (conf={conf_score:.0f})")
+                    record["epic_id"] = conf_epic
+            else:
+                epic_confidence = 50.0  # Couldn't verify — mark as uncertain
+        elif not record["epic_id"]:
+            # No EPIC found at all — try confidence-scored extraction as last resort
+            conf_epic, conf_score = _ocr_epic_id_with_confidence(cell_img)
+            if conf_epic:
+                record["epic_id"] = conf_epic
+                epic_confidence = conf_score
+
+        record["_epic_confidence"] = epic_confidence
+
         # Track valid EPIC prefixes for 2-letter prefix recovery
         _track_epic_prefix(record.get("epic_id", ""))
 
-        # Skip truly empty cells (no name and no EPIC ID found)
-        if not record["name_english"] and not record["epic_id"]:
+        # Skip cells without enough valid signals (defense in depth after ink check)
+        if not _is_record_valid(record):
             continue
 
         record["_cell_index"] = i
         eng_records.append(record)
+
+    # Trim trailing empty rows before serial inference (safety net for partial pages)
+    eng_records = _trim_trailing_empty_rows(eng_records)
 
     # Infer missing serial numbers from surrounding records
     _infer_serial_numbers(eng_records)
@@ -1858,12 +2231,14 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
             serial_data = tam_data.pop("_by_serial", {})
             position_data = tam_data.pop("_by_position", {})
 
-            # First pass: merge by EPIC ID
+            # First pass: merge by EPIC ID (only when EPIC confidence >= 70)
             for record in eng_records:
                 epic = record.get("epic_id", "")
-                if epic and epic in tam_data:
+                epic_conf = record.get("_epic_confidence", 100.0)
+                if epic and epic in tam_data and epic_conf >= 70:
                     record["name_tamil"] = tam_data[epic]["name_tamil"]
                     record["relation_name_tamil"] = tam_data[epic]["relation_name_tamil"]
+                    record["_tamil_match_method"] = "epic"
 
             # Second pass: fill gaps using serial number matching
             for record in eng_records:
@@ -1873,6 +2248,7 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
                 if serial and serial in serial_data:
                     record["name_tamil"] = serial_data[serial]["name_tamil"]
                     record["relation_name_tamil"] = serial_data[serial]["relation_name_tamil"]
+                    record["_tamil_match_method"] = "serial"
 
             # Third pass: fill remaining gaps using cell position matching
             # Both EN and TA pages share the same grid layout, so cell N maps to cell N
@@ -1885,6 +2261,27 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
                     if pos_entry["name_tamil"]:
                         record["name_tamil"] = pos_entry["name_tamil"]
                         record["relation_name_tamil"] = pos_entry["relation_name_tamil"]
+                        record["_tamil_match_method"] = "position"
+
+            # Cross-validate: for low-confidence EPICs matched via EPIC,
+            # check if position-based match gives a different result
+            for record in eng_records:
+                if record.get("_tamil_match_method") != "epic":
+                    continue
+                epic_conf = record.get("_epic_confidence", 100.0)
+                if epic_conf >= 80:
+                    continue  # High confidence — trust EPIC match
+                cell_idx = record.get("_cell_index")
+                if cell_idx is not None and cell_idx in position_data:
+                    pos_entry = position_data[cell_idx]
+                    if (pos_entry["name_tamil"] and
+                            pos_entry["name_tamil"] != record["name_tamil"]):
+                        log.debug(f"Tamil cross-validation: EPIC match '{record['name_tamil']}' "
+                                  f"vs position match '{pos_entry['name_tamil']}' "
+                                  f"(epic_conf={epic_conf:.0f}) — preferring position")
+                        record["name_tamil"] = pos_entry["name_tamil"]
+                        record["relation_name_tamil"] = pos_entry["relation_name_tamil"]
+                        record["_tamil_match_method"] = "position_crossval"
 
             # Cross-validate: fill serial gaps from Tamil page serials
             for record in eng_records:
@@ -1899,6 +2296,8 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
     # Clean up and set defaults
     for record in eng_records:
         record.pop("_cell_index", None)
+        record.pop("_epic_confidence", None)
+        record.pop("_tamil_match_method", None)
         if "name_tamil" not in record:
             record["name_tamil"] = ""
         if "relation_name_tamil" not in record:

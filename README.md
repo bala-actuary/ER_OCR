@@ -1,35 +1,37 @@
-# Electoral Roll OCR Extraction Tool (v1.0)
+# Electoral Roll OCR Extraction Tool (v1.1)
 
-Extracts voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV files using local OCR. Completely offline, zero API cost, and achieves **99.30% cell-level accuracy** across 6,510 validated records.
+Extracts voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV files using local OCR. Completely offline, zero API cost, and achieves **99.87% cell-level accuracy** across 1,118 validated records.
 
 ## Why OCR Instead of LLM?
 
 | Factor | OCR (this tool) | LLM-based |
 |--------|----------------|-----------|
 | **Cost** | $0 (runs locally) | API costs per page (~$0.01-0.05/page) |
-| **Accuracy** | 99.30% cell accuracy | Comparable, but varies by model |
-| **Speed** | ~45s per page pair | Depends on API rate limits |
+| **Accuracy** | 99.87% cell accuracy | Comparable, but varies by model |
+| **Speed** | ~60s per page pair | Depends on API rate limits |
 | **Scalability** | Run 1000s of pairs overnight with multi-worker | Limited by API quotas and cost |
 | **Privacy** | All data stays local | Data sent to external API |
 | **Offline** | Works without internet | Requires internet |
 
-With 4 workers, the tool processes ~11,700 page pairs in ~5-6 hours — run it overnight and have all results in the morning. The 99.30% accuracy was achieved through 4 phases of targeted improvements (EPIC ID extraction, Tamil matching, grid detection fallbacks) without any LLM involvement.
+With 4 workers, the tool processes ~11,700 page pairs overnight. Accuracy was achieved through 5 phases of targeted improvements including empty cell detection, multi-strategy EPIC/serial voting, confidence-aware Tamil matching, and consecutive-run serial anchoring.
 
 ## Architecture
 
 ```
-PDF --> PyMuPDF (extract image) --> OpenCV (detect grid, crop 30 cells)
-    --> Tesseract OCR (per cell) --> Regex parsing --> Merge EN+TA --> CSV
+PDF --> PyMuPDF (extract image) --> OpenCV (detect grid, crop cells)
+    --> Empty cell filter (ink density) --> Tesseract OCR (per cell)
+    --> Multi-signal validation --> Regex parsing --> Merge EN+TA --> CSV
 ```
 
 | Component | Library | Purpose |
 |-----------|---------|---------|
 | PDF image extraction | PyMuPDF (`fitz`) | Extract embedded PNG from each single-page PDF |
 | Grid detection | OpenCV | Morphological ops to find 3x10 row/column grid |
+| Empty cell detection | OpenCV | Ink density analysis to skip empty cells before OCR |
 | Image preprocessing | OpenCV | CLAHE, denoising, adaptive threshold, 4x upscale |
 | OCR | Tesseract 5.4+ (`pytesseract`) | Text recognition (PSM 6, OEM 1) |
 | Field parsing | Python `re` | Regex extraction with fuzzy label matching |
-| Tamil matching | EPIC ID + serial + position | Match Tamil page to English page |
+| Tamil matching | EPIC ID (confidence-aware) + serial + position | Match Tamil page to English page |
 
 ## Quick Start
 
@@ -112,7 +114,7 @@ python split_pdfs.py --ac AC-188
 python split_pdfs.py
 ```
 
-This splits each multi-page PDF into individual page files, skipping metadata pages (2 for English, 3 for Tamil). Output goes to `Input/split_files/AC-188/{english,tamil}/`.
+This splits each multi-page PDF into individual page files. **All pages are split** — non-data pages (metadata, summary, maps) are auto-detected and skipped during extraction in Step 3. Output goes to `Input/split_files/AC-188/{english,tamil}/`.
 
 ### Step 3: Extract Data
 
@@ -149,6 +151,14 @@ python merge_outputs.py
 ```
 
 This merges page-level CSVs back into part-level files (matching the original downloaded PDFs). Output goes to `output/merged/AC-188/`.
+
+**Important:** The merge script does a **full rewrite** of each part CSV, not an incremental append. Once a part is merged, it is marked as done in a checkpoint and skipped on subsequent runs. If you extract additional pages for a part that was already merged (e.g., extracted 20 pages, merged, then extracted the remaining 26), you must use `--force` to re-merge and pick up the new pages:
+
+```bash
+python merge_outputs.py --ac AC-188 --force
+```
+
+For best results, complete all extraction for a part before merging.
 
 ### Step 5: Check Progress
 
@@ -221,6 +231,8 @@ Options:
   --force           Overwrite existing split files
 ```
 
+All pages are split (no metadata pages skipped). Non-data pages are auto-detected and skipped during extraction by `extract_ocr.py`.
+
 ### `extract_ocr.py` — Extract Data from PDFs
 
 ```
@@ -254,8 +266,11 @@ python merge_outputs.py [options]
 
 Options:
   --ac AC-xxx       Assembly Constituency (e.g., AC-188). Prompts if omitted.
-  --force           Re-merge even if checkpoint says already done
+  --force           Re-merge all parts from scratch (required if new pages were
+                    extracted after a previous merge)
 ```
+
+Note: Each merge does a full rewrite of the part CSV from all available page CSVs — it does not append. Without `--force`, already-merged parts are skipped.
 
 ### `analyze_quality.py` — Quality Analysis
 
@@ -268,6 +283,13 @@ Options:
 
 ## How It Works
 
+### Page Splitting
+`split_pdfs.py` splits all pages from multi-page PDFs into individual page files. No pages are skipped during splitting — non-data pages (metadata, summary, maps, legends) are auto-detected and skipped during extraction.
+
+### Empty Cell Detection (v1.1)
+
+Before running OCR on each cell, ink density is analyzed. Cells with less than 2% ink coverage (after excluding grid line borders) are skipped. This eliminates phantom records from empty cells on partial pages (pages with fewer than 30 entries), with zero OCR cost.
+
 ### Grid Detection
 Each PDF page contains a 3-column x 10-row grid of voter entries (max 30 per page). OpenCV detects:
 - **Horizontal lines** using morphological opening with a wide kernel
@@ -275,52 +297,81 @@ Each PDF page contains a 3-column x 10-row grid of voter entries (max 30 per pag
 - **Fallback**: If detected columns span <85% of page width, falls back to proportional `[2%, 34%, 66%, 98%]`
 
 ### Cell OCR
-Each cell is cropped, upscaled 4x (Lanczos), preprocessed (CLAHE + denoise + adaptive threshold), then passed to Tesseract:
-- **English cells**: `--psm 6 --oem 1` with `lang=eng`
-- **Tamil cells**: `--psm 6 --oem 1` with `lang=tam+eng` (bottom 20% cropped to avoid label contamination)
+Each non-empty cell is cropped, upscaled 4x (Lanczos), preprocessed, then passed to Tesseract:
+- **English cells**: `--psm 4 --oem 1` with `lang=eng`
+- **Tamil cells**: `--psm 6 --oem 1` with `lang=tam+eng` (bottom 15% cropped to avoid label contamination), with retry using alternative preprocessing (Otsu, less aggressive crop) when initial result is poor
+
+### Multi-Signal Record Validation (v1.1)
+
+Records must have at least 2 valid signals (name, EPIC ID, serial number, age+gender, house number) to be accepted. This prevents noise from empty or partially-filled cells from creating phantom records.
+
+### Serial Number Accuracy (v1.1)
+
+- **Multi-strategy voting**: Serial numbers extracted using 3 threshold strategies (fixed 150, Otsu, fixed 120) with majority voting
+- **Cross-validation**: Targeted serial always cross-validates the primary OCR result
+- **Consecutive-run anchoring**: Stray serial filter uses the longest consecutive run as anchor instead of median, preventing a single misread from cascading into incorrect corrections
+
+### EPIC ID Confidence Scoring (v1.1)
+
+- **Multi-strategy voting**: 3 preprocessing strategies (CLAHE, Otsu, sharpen) with confidence scoring
+- **Consensus detection**: If 2+ strategies agree, confidence is boosted
+- **Confidence-aware Tamil matching**: Low-confidence EPICs (<70) skip EPIC-based Tamil matching in favor of position-based matching
 
 ### Field Parsing
 Regex patterns with fuzzy label matching handle common OCR errors:
 - `"Fatner Name"` --> `"Father Name"`, `"Gerder"` --> `"Gender"`
 - EPIC ID `O` --> `0` correction in digit positions
 
+### Tamil Name Quality (v1.1)
+
+- Gender labels ("ஆண்", "பெண்") and noise words are filtered from Tamil name output
+- Minimum 3 Tamil characters required (rejects single-char OCR fragments)
+- Retry with alternative preprocessing (Otsu threshold, less aggressive crop) when initial result is poor
+
 ### Tamil Page Matching
 1. Extract EPIC IDs from English page
 2. Try Tamil pages at same number, +/-1 first (fast path)
 3. Fall back to scanning all Tamil pages for the part
-4. Position-based fallback if EPIC matching fails
+4. **EPIC-based matching** (Pass 1): Only used when EPIC confidence >= 70
+5. **Serial-based matching** (Pass 2): Fills gaps from Pass 1
+6. **Position-based matching** (Pass 3): Cell index fallback
+7. **Cross-validation**: Low-confidence EPIC matches are verified against position-based results
 
 ### Checkpoints
 After each page pair, the filename is saved to `checkpoint.json` inside the AC directory. Processing can be stopped and resumed at any time.
 
 ## Accuracy
 
-Validated on 240 page pairs across 4 directories (6,510 voter records):
+Validated on AC-166 Part 1 (46 page pairs, 1,118 voter records including 10 partial pages):
 
 | Metric | Value |
 |--------|-------|
-| **Overall cell accuracy** | **99.30%** |
-| **All 12 fields complete** | **93.0%** |
-| EPIC ID fill rate | 97.3% |
-| Name (English) | 99.4% |
-| Name (Tamil) | 99.9% |
-| Relation Name (English) | 99.8% |
-| Relation Name (Tamil) | 98.3% |
-| Age | 98.9% |
-| Gender | 98.8% |
+| **Overall cell accuracy** | **99.87%** |
+| **Record completeness** | **98.39%** |
+| Serial number accuracy | 100% |
+| EPIC ID fill rate | 99.9% |
+| Name (English) | 99.8% |
+| Name (Tamil) | 99.8% |
 | Malformed EPIC IDs | 0 |
 
-Accuracy was achieved through 4 phases of targeted improvements including multi-ROI EPIC extraction from Tamil cells, position-based Tamil matching fallback, column collapse detection, and ASCII contamination guards.
+v1.1 improvements over v1.0:
+
+- Eliminated phantom records on partial pages (pages with <30 entries)
+- Fixed serial number misreads caused by stray filter cascading (e.g., 505 misread as 605)
+- Improved Tamil name quality: no more gender labels or single-char fragments as names
+- Reduced EPIC digit misreads via multi-strategy confidence voting
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Per page pair (sequential) | ~45 seconds |
-| Per AC (~720 pairs, 4 workers) | ~2-3 hours |
-| All ACs (~11,700 pairs, 4 workers) | ~5-6 hours |
+| Per page pair (sequential) | ~60 seconds |
+| Per AC (~720 pairs, 4 workers) | ~3-4 hours |
+| All ACs (~11,700 pairs, 4 workers) | ~6-8 hours |
 | Cost | $0 (all local) |
 | RAM usage (4 workers) | ~800 MB |
+
+Note: v1.1 is slightly slower per page than v1.0 due to multi-strategy EPIC/serial voting. The additional OCR passes only trigger when needed (low confidence or missing fields).
 
 ## Run Logs
 
@@ -332,6 +383,7 @@ Each extraction run generates:
 
 | Issue | Solution |
 |-------|----------|
+| `setup.bat` fails to install Tesseract | `winget` may not be available on your system. Install Tesseract manually from [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki), then re-run `setup.bat` |
 | `Tesseract OCR not found` | Verify install path; check that `C:\Program Files\Tesseract-OCR\tesseract.exe` exists |
 | `No module named 'fitz'` | Run `pip install pymupdf` |
 | Tamil names are empty | Verify `tam` appears in `tesseract --list-langs` |
@@ -339,12 +391,35 @@ Each extraction run generates:
 | Processing is slow | Reduce `--workers` if RAM is limited; increase for faster CPUs |
 | `Permission denied` on tessdata | Copy `tam.traineddata` using an admin terminal |
 | Unicode errors on Windows | The script handles UTF-8 encoding automatically |
+| Merge missing new pages | Use `python merge_outputs.py --ac AC-xxx --force` to re-merge |
 
 ## Known Limitations
 
 - **OCR accuracy ceiling at 115 DPI**: Source PDFs are rasterized at 115 DPI, limiting OCR precision for some characters
-- **EPIC ID misreads**: Occasional letter/digit confusion (e.g., `RVI` vs `RVJ`) — inherent to OCR at this resolution
-- **Processing speed**: ~45s per page pair due to Tesseract OCR overhead; parallelized with `--workers`
+- **EPIC ID misreads**: Occasional letter/digit confusion (e.g., `RVI` vs `RVJ`) — inherent to OCR at this resolution, mitigated by multi-strategy voting in v1.1
+- **Tamil name quality on partial pages**: A few cells on partial pages may have missing or mismatched Tamil names due to garbled OCR at 115 DPI
+- **Processing speed**: ~60s per page pair due to Tesseract OCR overhead and multi-strategy voting; parallelized with `--workers`
+
+## Changelog
+
+### v1.1 (2026-03-14)
+
+- **Split all pages**: `split_pdfs.py` no longer skips metadata pages; non-data pages are auto-detected during extraction
+- **Empty cell detection**: Pre-OCR ink density analysis eliminates phantom records on partial pages
+- **Multi-signal record validation**: Requires 2+ valid fields to accept a record
+- **Serial number multi-strategy voting**: 3 threshold strategies with majority voting and cross-validation
+- **Consecutive-run serial anchor**: Stray filter uses longest consecutive run instead of median, preventing misread cascades
+- **Trailing empty row trim**: Safety net removes noise records from bottom of partial pages
+- **Tamil name quality**: Minimum 3 Tamil characters, gender/noise label rejection, expanded noise word list
+- **Tamil OCR retry**: Alternative preprocessing (Otsu, less aggressive crop) when initial Tamil result is poor
+- **EPIC confidence scoring**: Multi-strategy voting with per-word confidence from Tesseract
+- **Confidence-aware Tamil matching**: Low-confidence EPICs skip to position-based matching; cross-validation for borderline cases
+- **Merge documentation**: Clarified that merge does full rewrite, not append; `--force` required for re-merge
+
+### v1.0
+
+- Initial release with 4 phases of OCR improvements
+- 99.30% cell-level accuracy across 6,510 validated records
 
 ## License
 
