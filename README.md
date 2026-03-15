@@ -142,7 +142,7 @@ python extract_ocr.py
 
 Output CSVs (one per page) are saved to `output/split_files/AC-188/`.
 
-### Step 4: Merge Page CSVs into Part Files
+### Step 4: Merge Page CSVs into Part and AC Files
 
 ```bash
 python merge_outputs.py --ac AC-188
@@ -172,7 +172,7 @@ bash check-progress.sh
 ER_OCR/
 ├── extract_ocr.py          # Main OCR extraction script
 ├── split_pdfs.py           # Split multi-page PDFs into individual pages
-├── merge_outputs.py        # Merge page CSVs into part-level CSVs
+├── merge_outputs.py        # Merge page CSVs into part-level and AC-level CSVs
 ├── analyze_quality.py      # Quality analysis and accuracy reporting
 ├── check-progress.sh       # Progress monitoring script
 ├── setup.bat               # Automated setup (Windows)
@@ -190,8 +190,11 @@ ER_OCR/
 ├── output/
 │   ├── split_files/
 │   │   └── AC-xxx/         # Page-level CSVs (one per page)
-│   └── merged/
-│       └── AC-xxx/         # Part-level merged CSVs
+│   └── merged_files/
+│       ├── parts/
+│       │   └── AC-xxx/     # Part-level merged CSVs
+│       └── ac/
+│           └── AC-xxx.csv  # AC-level merged CSV (entire constituency)
 └── logs/                   # Per-run log files and JSON summaries
 ```
 
@@ -259,7 +262,7 @@ Part filtering examples:
   python extract_ocr.py AC-188 --dry-run --part 101      # Preview Part 101 pending pairs
 ```
 
-### `merge_outputs.py` — Merge Page CSVs into Part Files
+### `merge_outputs.py` — Merge Page CSVs into Part and AC Files
 
 ```
 python merge_outputs.py [options]
@@ -270,7 +273,7 @@ Options:
                     extracted after a previous merge)
 ```
 
-Note: Each merge does a full rewrite of the part CSV from all available page CSVs — it does not append. Without `--force`, already-merged parts are skipped.
+Produces both part-level CSVs (`output/merged_files/parts/AC-xxx/`) and a single AC-level CSV (`output/merged_files/ac/AC-xxx.csv`). Each merge does a full rewrite — it does not append. Without `--force`, already-merged parts are skipped. The AC-level file is always regenerated from current part CSVs.
 
 ### `analyze_quality.py` — Quality Analysis
 
