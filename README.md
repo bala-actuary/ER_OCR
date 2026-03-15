@@ -1,4 +1,4 @@
-# Electoral Roll OCR Extraction Tool (v1.1)
+# Electoral Roll OCR Extraction Tool (v1.2)
 
 Extracts voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV files using local OCR. Completely offline, zero API cost, and achieves **99.87% cell-level accuracy** across 1,118 validated records.
 
@@ -150,7 +150,7 @@ python merge_outputs.py --ac AC-188
 python merge_outputs.py
 ```
 
-This merges page-level CSVs back into part-level files (matching the original downloaded PDFs). Output goes to `output/merged/AC-188/`.
+This merges page-level CSVs back into part-level and AC-level files. Output goes to `output/merged_files/parts/AC-188/` (per-part) and `output/merged_files/ac/AC-188.csv` (entire constituency).
 
 **Important:** The merge script does a **full rewrite** of each part CSV, not an incremental append. Once a part is merged, it is marked as done in a checkpoint and skipped on subsequent runs. If you extract additional pages for a part that was already merged (e.g., extracted 20 pages, merged, then extracted the remaining 26), you must use `--force` to re-merge and pick up the new pages:
 
@@ -401,6 +401,11 @@ Each extraction run generates:
 - **Processing speed**: ~60s per page pair due to Tesseract OCR overhead and multi-strategy voting; parallelized with `--workers`
 
 ## Changelog
+
+### v1.2 (2026-03-15)
+
+- **AC-level merge**: `merge_outputs.py` now automatically produces a single CSV per constituency alongside part-level files
+- **Output directory restructure**: Merged output moved from `output/merged/` to `output/merged_files/parts/` and `output/merged_files/ac/`
 
 ### v1.1 (2026-03-14)
 

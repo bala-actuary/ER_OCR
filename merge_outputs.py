@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Merge page-level CSV outputs into part-level CSV files.
+Merge page-level CSV outputs into part-level and AC-level CSV files.
 
-Reads page-level CSVs from output/split_files/AC-xxx/ and merges them into
-part-level CSVs in output/merged/AC-xxx/.
+Reads page-level CSVs from output/split_files/AC-xxx/ and produces:
+  1. Part-level CSVs in output/merged_files/parts/AC-xxx/ (one per original PDF part)
+  2. AC-level CSV in output/merged_files/ac/AC-xxx.csv (single file for entire constituency)
 
 Example:
     Page CSVs:
         2026-EROLLGEN-S22-184-SIR-FinalRoll-Revision1-ENG-1-WI_page_3.csv
-        2026-EROLLGEN-S22-184-SIR-FinalRoll-Revision1-ENG-1-WI_page_4.csv
         ...
-        2026-EROLLGEN-S22-184-SIR-FinalRoll-Revision1-ENG-1-WI_page_30.csv
 
-    Merged output:
-        2026-EROLLGEN-S22-184-SIR-FinalRoll-Revision1-ENG-1-WI.csv
+    Part-level output:
+        output/merged_files/parts/AC-188/2026-EROLLGEN-...-ENG-1-WI.csv
+
+    AC-level output:
+        output/merged_files/ac/AC-188.csv
 
 Usage:
     python merge_outputs.py                     # Interactive prompt
@@ -33,7 +35,8 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 SPLIT_OUTPUT_DIR = SCRIPT_DIR / "output" / "split_files"
-MERGED_OUTPUT_DIR = SCRIPT_DIR / "output" / "merged"
+MERGED_OUTPUT_DIR = SCRIPT_DIR / "output" / "merged_files" / "parts"
+AC_MERGED_DIR = SCRIPT_DIR / "output" / "merged_files" / "ac"
 
 # Regex to extract the _page_NN suffix from CSV filenames
 PAGE_SUFFIX_RE = re.compile(r"_page_(\d+)\.csv$")
@@ -133,6 +136,57 @@ def save_merge_checkpoint(ac_dir: Path, data: dict):
         json.dump(data, f, indent=2)
 
 
+def merge_ac_csv(ac_name: str, merged_dir: Path) -> int:
+    """Merge all part-level CSVs into a single AC-level CSV.
+
+    Reads all part CSVs from merged_dir, concatenates and sorts by Part No then Serial No.
+    Returns the total number of data records written.
+    """
+    part_csvs = sorted(f for f in merged_dir.glob("*.csv") if f.name != "merge_checkpoint.json")
+    if not part_csvs:
+        return 0
+
+    all_rows = []
+    header = None
+
+    for csv_path in part_csvs:
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            if not rows:
+                continue
+            if header is None:
+                header = rows[0]
+            all_rows.extend(rows[1:])
+
+    if header is None:
+        return 0
+
+    # Sort by Part No (column 1) then Serial No (column 2) -- both numeric
+    def ac_sort_key(row):
+        try:
+            part = int(row[1]) if len(row) > 1 and row[1].strip() else 999999
+        except ValueError:
+            part = 999999
+        try:
+            serial = int(row[2]) if len(row) > 2 and row[2].strip() else 999999
+        except ValueError:
+            serial = 999999
+        return (part, serial)
+
+    all_rows.sort(key=ac_sort_key)
+
+    # Write AC-level CSV
+    ac_output_path = AC_MERGED_DIR / f"{ac_name}.csv"
+    ac_output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(ac_output_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(all_rows)
+
+    return len(all_rows)
+
+
 def prompt_ac_number() -> str:
     """Interactively prompt the user for an AC number."""
     available = list_available_acs()
@@ -221,12 +275,17 @@ def main():
         checkpoint["last_merged"] = datetime.now().isoformat()
         save_merge_checkpoint(merged_dir, checkpoint)
 
+    # AC-level merge: combine all part CSVs into a single AC file
+    ac_record_count = merge_ac_csv(ac_name, merged_dir)
+    ac_output_path = AC_MERGED_DIR / f"{ac_name}.csv"
+
     print(f"\n{'='*60}")
     print(f"Done! Merged {merged_count} part(s) from {total_parts} total")
     if skipped_count > 0:
         print(f"  Skipped {skipped_count} already-merged part(s) (use --force to re-merge)")
     print(f"  Total records: {grand_total_records}")
-    print(f"  Merged files saved to: {merged_dir}")
+    print(f"  Part-level files: {merged_dir}")
+    print(f"  AC-level file:    {ac_output_path} ({ac_record_count} records)")
     print(f"{'='*60}")
 
 

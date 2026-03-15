@@ -58,7 +58,7 @@ except ImportError:
 OCR_DIR = Path(__file__).parent          # ER_OCR/
 INPUT_BASE = OCR_DIR / "Input" / "split_files"
 OUTPUT_BASE = OCR_DIR / "output" / "split_files"
-MERGED_BASE = OCR_DIR / "output" / "merged"
+MERGED_BASE = OCR_DIR / "output" / "merged_files" / "parts"
 LOG_DIR = OCR_DIR / "logs"
 
 # Legacy paths (for backward compatibility with old checkpoint location)

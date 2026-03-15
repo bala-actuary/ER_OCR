@@ -35,7 +35,7 @@ def discover_output_dirs(ac_filter=None):
         for d in sorted(os.listdir(legacy_base)):
             full = os.path.join(legacy_base, d)
             if os.path.isdir(full) and d.startswith("AC-") and full not in dirs:
-                if d == "split_files" or d == "merged":
+                if d in ("split_files", "merged", "merged_files"):
                     continue
                 if ac_filter is None or d.startswith(ac_filter):
                     dirs.append(full)
