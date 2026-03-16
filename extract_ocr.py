@@ -72,6 +72,10 @@ CSV_HEADERS = [
     "DOB", "ContactNo",
 ]
 
+# Extra columns appended when --cross-check (or --validate) is active.
+# Default runs always produce the 14-column CSV above.
+CSV_HEADERS_CROSSCHECK = CSV_HEADERS + ["Cross_Check", "Cross_Check_Notes"]
+
 # ----- Logging -----
 
 log = logging.getLogger("extract_ocr")
@@ -1032,6 +1036,47 @@ def _ocr_epic_id_with_confidence(cell_img: np.ndarray) -> tuple[str, float]:
         return candidates[0]
 
 
+def _ocr_epic_fast(cell_img: np.ndarray) -> str:
+    """
+    Single-strategy EPIC ID extraction for cross-validation purposes.
+    Faster than _ocr_epic_id_with_confidence (1 pass instead of 3).
+    Returns matched EPIC string or "" if nothing valid found.
+    """
+    h, w = cell_img.shape[:2]
+    roi = cell_img[0:int(h * 0.35), int(w * 0.3):w]
+    if roi.size == 0:
+        return ""
+    scale = 4
+    upscaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+    gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY) if len(upscaled.shape) == 3 else upscaled
+    thresh = preprocess_for_ocr(gray)
+    config = "--psm 7 --oem 1 --dpi 300 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    try:
+        text = pytesseract.image_to_string(thresh, lang="eng", config=config).strip()
+        candidate = fix_epic_id(text)
+        if candidate and re.match(r"^[A-Z]{3}\d{7}$", candidate):
+            return candidate
+    except Exception:
+        pass
+    return ""
+
+
+def _ocr_full_cell_english(cell_img: np.ndarray) -> str:
+    """
+    Quick English OCR on a full cell image.
+    Used in cross-check mode to extract House No from Tamil cells
+    (field labels and values are in English even on Tamil pages).
+    """
+    scale = 4
+    upscaled = cv2.resize(cell_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+    gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY) if len(upscaled.shape) == 3 else upscaled
+    thresh = preprocess_for_ocr(gray)
+    try:
+        return pytesseract.image_to_string(thresh, lang="eng", config="--psm 6 --oem 1 --dpi 300")
+    except Exception:
+        return ""
+
+
 # ----- Text Parsing -----
 
 # Regex patterns with fuzzy label matching for OCR errors
@@ -1938,11 +1983,16 @@ def is_non_data_page(text: str) -> bool:
     return False
 
 
-def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
+def _ocr_tamil_page(tam_path: str, cross_check: bool = False) -> dict[str, dict]:
     """
     OCR a Tamil page and return a dict of {epic_id: {name_tamil, relation_name_tamil}}.
     Also returns fallback dicts under "_by_serial" (keyed by serial_no) and
     "_by_position" (keyed by cell index) for position-based last-resort matching.
+
+    When cross_check=True, each entry also stores:
+      "_cell_img"  — the raw cell numpy array (for EPIC fast re-extraction)
+      "_en_text"   — English OCR text of the full cell (for House No extraction)
+      "_serial_no" — serial number extracted from Tamil cell (for serial cross-check)
     """
     result_by_epic = {}
     result_by_serial = {}
@@ -1982,6 +2032,12 @@ def _ocr_tamil_page(tam_path: str) -> dict[str, dict]:
             "name_tamil": tam_data["name_tamil"],
             "relation_name_tamil": tam_data["relation_name_tamil"],
         }
+
+        # When cross-check mode is active, retain extra data for validation
+        if cross_check:
+            tam_entry["_cell_img"] = cell_img
+            tam_entry["_en_text"] = _ocr_full_cell_english(cell_img)
+            tam_entry["_serial_no"] = serial_no or ""
 
         if epic_id and re.match(r"^[A-Z]{3}\d{7}$", epic_id):
             result_by_epic[epic_id] = tam_entry
@@ -2090,7 +2146,8 @@ def _find_tamil_page(eng_page_no: int, eng_epic_ids: set[str], tamil_pages: dict
     return None
 
 
-def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no: int = 0) -> list[dict]:
+def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no: int = 0,
+                 cross_check: bool = False) -> list[dict]:
     """
     Process one English PDF page and find+merge its Tamil pair.
 
@@ -2224,10 +2281,13 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
     # Find matching Tamil page using EPIC IDs
     eng_epic_ids = {r["epic_id"] for r in eng_records if r.get("epic_id")}
 
+    tam_path = None      # set below if Tamil page is found
+    position_data = {}   # keyed by cell index; used by cross-check block
+
     if tamil_pages:
         tam_path = _find_tamil_page(eng_page_no, eng_epic_ids, tamil_pages)
         if tam_path:
-            tam_data = _ocr_tamil_page(tam_path)
+            tam_data = _ocr_tamil_page(tam_path, cross_check=cross_check)
             serial_data = tam_data.pop("_by_serial", {})
             position_data = tam_data.pop("_by_position", {})
 
@@ -2293,6 +2353,49 @@ def process_page(eng_path: str, tamil_pages: dict[int, str] = None, eng_page_no:
                                 record["serial_no"] = ts
                                 break
 
+    # Cross-validate English vs Tamil cell fields (only in --cross-check / --validate mode)
+    if cross_check and tam_path:
+        for record in eng_records:
+            notes = []
+
+            cell_idx = record.get("_cell_index")
+            pos_entry = position_data.get(cell_idx, {}) if cell_idx is not None else {}
+
+            # 1. EPIC ID cross-check: re-extract EPIC from Tamil cell top-right ROI
+            tam_cell_img = pos_entry.get("_cell_img")
+            if tam_cell_img is not None:
+                ta_epic = _ocr_epic_fast(tam_cell_img)
+                en_epic = record.get("epic_id", "")
+                if ta_epic and en_epic and ta_epic != en_epic:
+                    notes.append(f"EPIC mismatch EN={en_epic} TA={ta_epic}")
+
+            # 2. House No cross-check: apply HOUSE_RE to English OCR text of Tamil cell
+            en_text = pos_entry.get("_en_text", "")
+            if en_text:
+                house_m = HOUSE_RE.search(en_text)
+                if house_m:
+                    ta_house = house_m.group(1).strip()
+                    en_house = record.get("house_no", "").lstrip("'")
+                    if ta_house and en_house and ta_house != en_house:
+                        notes.append(f"House mismatch EN={en_house} TA={ta_house}")
+
+            # 3. Serial number cross-check
+            ta_serial = pos_entry.get("_serial_no", "")
+            en_serial = record.get("serial_no", "")
+            if ta_serial and en_serial and ta_serial != en_serial:
+                notes.append(f"Serial mismatch EN={en_serial} TA={ta_serial}")
+
+            # 4. Name length plausibility (Tamil chars vs English chars)
+            en_name = record.get("name_english", "")
+            ta_name = record.get("name_tamil", "")
+            if en_name and ta_name:
+                ratio = len(ta_name) / max(len(en_name), 1)
+                if ratio > 5.0 or ratio < 0.2:
+                    notes.append(f"Name length ratio {ratio:.1f} (EN={len(en_name)} TA={len(ta_name)})")
+
+            record["_cross_check_status"] = "REVIEW" if notes else "OK"
+            record["_cross_check_notes"] = "; ".join(notes)
+
     # Clean up and set defaults
     for record in eng_records:
         record.pop("_cell_index", None)
@@ -2340,11 +2443,16 @@ def validate_record(record: dict) -> list[str]:
 
 # ----- CSV Output -----
 
-def write_pair_csv(records: list[dict], output_dir: Path, ac_no: str, part_no: str, eng_filename: str):
+def write_pair_csv(records: list[dict], output_dir: Path, ac_no: str, part_no: str,
+                   eng_filename: str, cross_check: bool = False):
     """
     Write records for one page pair to a CSV file.
     Filename matches the English input PDF (with .csv extension).
     Creates a header-only file for non-data pages (summary/legend).
+
+    When cross_check=True, appends two extra columns:
+      Cross_Check       — "OK" or "REVIEW"
+      Cross_Check_Notes — semicolon-separated mismatch descriptions
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     # Replace .pdf extension with .csv to match input filename
@@ -2360,9 +2468,11 @@ def write_pair_csv(records: list[dict], output_dir: Path, ac_no: str, part_no: s
 
     records.sort(key=sort_key)
 
+    headers = CSV_HEADERS_CROSSCHECK if cross_check else CSV_HEADERS
+
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(CSV_HEADERS)
+        writer.writerow(headers)
         for rec in records:
             house_no = str(rec.get("house_no", ""))
             if house_no and not house_no.startswith("'"):
@@ -2384,6 +2494,11 @@ def write_pair_csv(records: list[dict], output_dir: Path, ac_no: str, part_no: s
                 "",  # DOB
                 "",  # ContactNo
             ]
+
+            if cross_check:
+                row.append(rec.get("_cross_check_status", "OK"))
+                row.append(rec.get("_cross_check_notes", ""))
+
             writer.writerow(row)
 
     return csv_path
@@ -2395,11 +2510,12 @@ def _process_pair_worker(args: tuple) -> tuple[str, list[dict], list[str], str, 
     """
     Worker function for ProcessPoolExecutor.
     Returns (key, records, warnings, ac_no, part_no).
+    args tuple: (eng_path, tamil_pages, key, page_no, ac_no, part_no, cross_check)
     """
-    eng_path, tamil_pages, key, page_no, ac_no, part_no = args
+    eng_path, tamil_pages, key, page_no, ac_no, part_no, cross_check = args
     warnings = []
     try:
-        records = process_page(eng_path, tamil_pages, eng_page_no=page_no)
+        records = process_page(eng_path, tamil_pages, eng_page_no=page_no, cross_check=cross_check)
         for rec in records:
             warnings.extend(validate_record(rec))
         return (key, records, warnings, ac_no, part_no)
@@ -2409,7 +2525,9 @@ def _process_pair_worker(args: tuple) -> tuple[str, list[dict], list[str], str, 
 
 # ----- Directory Processing -----
 
-def process_directory(dir_name: str, workers: int = 4, validate_only: bool = False, limit: int = 0, part_filter: set[int] = None):
+def process_directory(dir_name: str, workers: int = 4, validate_only: bool = False,
+                      limit: int = 0, part_filter: set[int] = None, page_filter: int = None,
+                      cross_check: bool = False):
     """Process all unprocessed pairs in a directory."""
     directory = INPUT_BASE / dir_name
     if not directory.exists():
@@ -2433,13 +2551,22 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
     # Seed EPIC prefix table from existing output CSVs for prefix recovery
     _seed_prefix_table(output_dir)
 
-    # Filter to unprocessed
-    pending = [p for p in pairs if p["key"] not in processed_set]
+    # Filter to unprocessed (when --page is given with --validate, include already-processed pages)
+    if page_filter is not None and validate_only:
+        # Allow re-validating any page regardless of checkpoint
+        pending = list(pairs)
+    else:
+        pending = [p for p in pairs if p["key"] not in processed_set]
 
     # Filter by part number if specified
     if part_filter:
         pending = [p for p in pending if int(p["part_no"]) in part_filter]
         log.info(f"Part filter: processing parts {sorted(part_filter)}")
+
+    # Filter to a specific page number (useful with --validate to target a known data page)
+    if page_filter is not None:
+        pending = [p for p in pending if p["page_no"] == page_filter]
+        log.info(f"Page filter: targeting page {page_filter}")
 
     if validate_only:
         pending = pending[:1]
@@ -2465,7 +2592,7 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
         # Multiprocessing
         work_items = [
             (p["english_path"], p.get("tamil_pages", {}), p["key"], p["page_no"],
-             p["ac_no"], p["part_no"])
+             p["ac_no"], p["part_no"], cross_check)
             for p in pending
         ]
 
@@ -2487,7 +2614,8 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
                         total_warnings += 1
 
                 # Write per-pair CSV (even if empty — header-only for non-data pages)
-                csv_path = write_pair_csv(records, output_dir, ac_no, part_no, key)
+                csv_path = write_pair_csv(records, output_dir, ac_no, part_no, key,
+                                          cross_check=cross_check)
                 total_records += len(records)
                 total_files += 1
 
@@ -2504,7 +2632,8 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
             log.info(f"Processing {i + 1}/{len(pending)}: {pair['key']}")
 
             try:
-                records = process_page(pair["english_path"], pair.get("tamil_pages", {}), eng_page_no=pair["page_no"])
+                records = process_page(pair["english_path"], pair.get("tamil_pages", {}),
+                                       eng_page_no=pair["page_no"], cross_check=cross_check)
                 for rec in records:
                     rec_warnings = validate_record(rec)
                     for w in rec_warnings:
@@ -2514,7 +2643,8 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
                 total_records += len(records)
 
                 # Write per-pair CSV (even if empty — header-only for non-data pages)
-                csv_path = write_pair_csv(records, output_dir, pair["ac_no"], pair["part_no"], pair["key"])
+                csv_path = write_pair_csv(records, output_dir, pair["ac_no"], pair["part_no"],
+                                          pair["key"], cross_check=cross_check)
                 total_files += 1
                 log.info(f"  Extracted {len(records)} records -> {csv_path.name}")
 
@@ -2534,7 +2664,16 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
                         out.write(f"  Relation (TA): {rec.get('relation_name_tamil', '')}\n")
                         out.write(f"  House No: {rec.get('house_no', '')}\n")
                         out.write(f"  Age: {rec.get('age', '')}  Gender: {rec.get('gender', '')}\n")
+                        if cross_check:
+                            status = rec.get("_cross_check_status", "N/A")
+                            notes = rec.get("_cross_check_notes", "")
+                            out.write(f"  Cross-Check: {status}\n")
+                            if notes:
+                                out.write(f"  Notes: {notes}\n")
                     out.write(f"\nTotal records: {len(records)}\n")
+                    if cross_check:
+                        review_count = sum(1 for r in records if r.get("_cross_check_status") == "REVIEW")
+                        out.write(f"Cross-check flags: {review_count} REVIEW / {len(records)} total\n")
                     out.flush()
                     return
 
@@ -2636,7 +2775,18 @@ def main():
         "--part", type=str, default=None,
         help="Part number or range to process (e.g., --part 101 or --part 50-100)"
     )
+    parser.add_argument(
+        "--page", type=int, default=None,
+        help="Specific page number to validate (use with --validate, e.g., --part 3 --page 4)"
+    )
+    parser.add_argument(
+        "--cross-check", action="store_true",
+        help="Cross-validate EPIC ID, House No, and serial between English and Tamil cells. "
+             "Adds Cross_Check, Cross_Check_Notes, EPIC_Confidence columns to CSV output. "
+             "Also auto-enabled by --validate."
+    )
     args = parser.parse_args()
+    cross_check_mode = args.cross_check or args.validate
 
     # Verify Tesseract is available
     if pytesseract is None:
@@ -2777,6 +2927,8 @@ def main():
             validate_only=args.validate,
             limit=args.limit,
             part_filter=part_filter,
+            page_filter=args.page,
+            cross_check=cross_check_mode,
         )
 
 

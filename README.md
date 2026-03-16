@@ -1,4 +1,4 @@
-# Electoral Roll OCR Extraction Tool (v1.2)
+# Electoral Roll OCR Extraction Tool (v1.3)
 
 Extracts voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV files using local OCR. Completely offline, zero API cost, and achieves **99.87% cell-level accuracy** across 1,118 validated records.
 
@@ -222,6 +222,15 @@ ER_OCR/
 - House numbers prefixed with `'` to prevent Excel auto-formatting
 - Records sorted ascending by Serial No within each file
 
+When running with `--cross-check` or `--validate`, two additional columns are appended:
+
+| Column | Values | Description |
+|--------|--------|-------------|
+| Cross_Check | `OK` / `REVIEW` | `REVIEW` means at least one field disagreed between English and Tamil cells |
+| Cross_Check_Notes | text | Semicolon-separated list of mismatches (e.g., `EPIC mismatch EN=WXJ1234567 TA=WXJ1234568; House mismatch EN=3-5 TA=3-6`) |
+
+Cross-check columns are **never written** in normal production runs — they only appear when explicitly requested.
+
 ## CLI Reference
 
 ### `split_pdfs.py` — Split PDFs into Pages
@@ -246,12 +255,15 @@ Positional:
 
 Options:
   --all             Process all discovered AC directories
-  --validate        Process only 1 pair, print detailed output
+  --validate        Process only 1 pair, print detailed output (auto-enables --cross-check)
   --dry-run         List pending pairs without processing
   --reset           Reset checkpoint and output for a directory
   --part PARTS      Filter by part number: single (101), range (50-100), or mixed (1,5,10-20)
+  --page N          Target a specific page number (use with --validate to inspect a known data page)
   --workers N       Number of parallel workers (default: 4)
   --limit N         Process only N pairs, then stop
+  --cross-check     Cross-validate EPIC ID, House No, and serial between English and Tamil cells.
+                    Appends Cross_Check and Cross_Check_Notes columns to CSV output.
 
 Part filtering examples:
   python extract_ocr.py AC-188 --part 101               # Only Part 101
@@ -260,6 +272,11 @@ Part filtering examples:
   python extract_ocr.py AC-188 --reset --part 101        # Reset only Part 101
   python extract_ocr.py AC-188 --reset --part 50-100     # Reset Parts 50-100
   python extract_ocr.py AC-188 --dry-run --part 101      # Preview Part 101 pending pairs
+
+Validation examples:
+  python extract_ocr.py AC-188 --validate                # Validate first pending pair
+  python extract_ocr.py AC-188 --part 3 --page 4 --validate   # Validate specific page
+  python extract_ocr.py AC-188 --part 3 --page 4 --validate --cross-check  # With cross-check
 ```
 
 ### `merge_outputs.py` — Merge Page CSVs into Part and AC Files
@@ -404,6 +421,13 @@ Each extraction run generates:
 - **Processing speed**: ~60s per page pair due to Tesseract OCR overhead and multi-strategy voting; parallelized with `--workers`
 
 ## Changelog
+
+### v1.3 (2026-03-16)
+
+- **Cross-validation layer** (`--cross-check`): After extraction, re-examines Tamil cells to independently verify EPIC ID, House No, and serial number against the English cell values. Mismatches are flagged as `REVIEW` in two new optional CSV columns (`Cross_Check`, `Cross_Check_Notes`)
+- **House No cross-check**: Dedicated English-language OCR pass on Tamil cells to extract and compare house numbers — parallel to the existing EPIC ID cross-check
+- **Targeted page validation** (`--page N`): Allows `--validate` to target a specific page number within a part, bypassing the checkpoint so any page (including already-processed ones) can be re-inspected
+- **Zero overhead in production**: Cross-check columns are never written unless `--cross-check` or `--validate` is specified; default 14-column CSV format is unchanged
 
 ### v1.2 (2026-03-15)
 
