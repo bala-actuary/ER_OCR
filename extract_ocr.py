@@ -2526,7 +2526,7 @@ def _process_pair_worker(args: tuple) -> tuple[str, list[dict], list[str], str, 
 # ----- Directory Processing -----
 
 def process_directory(dir_name: str, workers: int = 4, validate_only: bool = False,
-                      limit: int = 0, part_filter: set[int] = None, page_filter: int = None,
+                      limit: int = 0, part_filter: set[int] = None, page_filter: set[int] = None,
                       cross_check: bool = False):
     """Process all unprocessed pairs in a directory."""
     directory = INPUT_BASE / dir_name
@@ -2565,8 +2565,8 @@ def process_directory(dir_name: str, workers: int = 4, validate_only: bool = Fal
 
     # Filter to a specific page number (useful with --validate to target a known data page)
     if page_filter is not None:
-        pending = [p for p in pending if p["page_no"] == page_filter]
-        log.info(f"Page filter: targeting page {page_filter}")
+        pending = [p for p in pending if p["page_no"] in page_filter]
+        log.info(f"Page filter: targeting pages {sorted(page_filter)}")
 
     if validate_only:
         pending = pending[:1]
@@ -2776,8 +2776,8 @@ def main():
         help="Part number or range to process (e.g., --part 101 or --part 50-100)"
     )
     parser.add_argument(
-        "--page", type=int, default=None,
-        help="Specific page number to validate (use with --validate, e.g., --part 3 --page 4)"
+        "--page", type=str, default=None,
+        help="Page number, range, or list (e.g., 4, 1-10, 1,5,10-20). Requires --part."
     )
     parser.add_argument(
         "--cross-check", action="store_true",
@@ -2927,7 +2927,7 @@ def main():
             validate_only=args.validate,
             limit=args.limit,
             part_filter=part_filter,
-            page_filter=args.page,
+            page_filter=parse_part_range(args.page) if args.page else None,
             cross_check=cross_check_mode,
         )
 

@@ -1,4 +1,4 @@
-# Electoral Roll OCR Extraction Tool (v1.3)
+# Electoral Roll OCR Extraction Tool (v1.4)
 
 Extracts voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV files using local OCR. Completely offline, zero API cost, and achieves **99.87% cell-level accuracy** across 1,118 validated records.
 
@@ -34,6 +34,16 @@ PDF --> PyMuPDF (extract image) --> OpenCV (detect grid, crop cells)
 | Tamil matching | EPIC ID (confidence-aware) + serial + position | Match Tamil page to English page |
 
 ## Quick Start
+
+### Option 0: Web UI (Recommended for new users)
+
+```batch
+start.bat
+```
+
+Opens a browser-based dashboard at `http://localhost:7000` with guided setup, one-click workflow execution, and real-time progress monitoring. No CLI knowledge required.
+
+> The CLI approach (below) remains fully supported and unchanged — the web UI is additive only.
 
 ### Option 1: Automated Setup (Windows)
 
@@ -175,8 +185,15 @@ ER_OCR/
 ├── merge_outputs.py        # Merge page CSVs into part-level and AC-level CSVs
 ├── analyze_quality.py      # Quality analysis and accuracy reporting
 ├── check-progress.sh       # Progress monitoring script
-├── setup.bat               # Automated setup (Windows)
-├── requirements.txt        # Python dependencies
+├── setup.bat               # Automated dependency setup (Windows)
+├── start.bat               # Web UI launcher (Windows) — run this to start the UI
+├── start.sh                # Web UI launcher (Linux/macOS)
+├── requirements.txt        # Python dependencies (OCR + web)
+├── web/                    # Web UI (FastAPI backend + browser frontend)
+│   ├── app.py              # FastAPI application entry point
+│   ├── api/                # API route modules
+│   └── core/               # Job manager, dep checker, queue manager
+│       └── static/         # HTML, CSS, JS (served at http://localhost:7000)
 ├── Input/
 │   ├── ER_Downloads/
 │   │   └── AC-xxx/         # Original downloaded PDFs
@@ -231,6 +248,76 @@ When running with `--cross-check` or `--validate`, two additional columns are ap
 
 Cross-check columns are **never written** in normal production runs — they only appear when explicitly requested.
 
+## Web UI (v1.4)
+
+### Starting the UI
+
+```batch
+start.bat          # Windows — auto-detects free port, opens at http://localhost:7000
+bash start.sh      # Linux/macOS
+```
+
+The server runs locally on loopback only (`127.0.0.1`) — no network exposure.
+
+### Layout
+
+The UI uses a **sidebar navigation** on desktop (collapses to a bottom bar on mobile):
+
+| Section | Purpose |
+|---------|---------|
+| **Setup** (gear icon) | Collapsible panel — check Tesseract, Tamil tessdata, and Python packages. Install missing deps with one click. |
+| **Workflow** | Select an AC (or create a new one with `+`), configure options, run individual steps or the full pipeline. System resources panel shows RAM-aware worker recommendation and disk space warning. |
+| **Live Logs** | Real-time streaming output from any running job. ETA estimator, colour-coded lines, kill button. |
+| **Data** | Browse all ACs — download merged CSVs, view extraction progress, check file validation. |
+| **History** | Browse and download past log files and run summary JSONs. |
+
+### Overnight Queue
+
+Add multiple ACs to the queue from the Workflow tab and click **Start Queue**. The tool runs split → extract → merge for each AC sequentially. Queue state is saved to `web/queue_state.json` — a server restart will resume from where it left off. A browser notification fires when each AC completes.
+
+### Worker Recommendation
+
+The system resources panel reads your CPU core count and available RAM, then recommends a safe worker count (rule: `min(cores-1, available_RAM_GB / 0.5)`). The slider turns yellow above the recommended value and red when risky. A disk space warning appears if the estimated output size for the selected AC approaches your free disk space.
+
+### Extract Options
+
+The Extract step in the Workflow tab exposes the full CLI interface:
+
+| Option | UI Control | Description |
+|--------|-----------|-------------|
+| `--part` | Text input | Process specific part number or range (e.g., "101" or "50-100") |
+| `--page` | Text input | Page number, range, or list within a part (e.g., "4", "1-10", "1,5,10-20"). Requires --part |
+| `--limit` | Number input | Max pairs to process (0 = all) |
+| `--cross-check` | Checkbox | Cross-validate EN vs TA cells, adds 2 extra columns |
+| `--reset` | Checkbox (yellow) | Clear checkpoint for specified part — shows confirmation dialog |
+
+Two utility buttons are also available:
+- **Dry Run** — runs `--dry-run` to show pending file pairs without processing
+- **Validate Page** — runs `--validate` with the current `--part`/`--page` settings
+
+Each pipeline step has a collapsible `ℹ` info button explaining what it does and where output goes.
+
+### Create New AC
+
+Click the green `+` button next to the AC dropdown to create a new AC input directory. Enter the AC number in `AC-xxx` format (e.g., `AC-188`) and the tool creates `Input/ER_Downloads/AC-xxx/{english,tamil}/` ready for PDF files.
+
+### Quick Validate / Preview
+
+The **Test 1 Page** button runs `extract_ocr.py --validate` on the selected AC and renders the extracted records as an inline table — useful for spot-checking OCR quality before committing to a full run.
+
+### Dependency Installation from UI
+
+The Setup tab can install missing components:
+- **Python packages** — runs `pip install -r requirements.txt`
+- **Tesseract OCR** — runs `winget install UB-Mannheim.TesseractOCR` (Windows)
+- **Tamil tessdata** — downloads `tam.traineddata` directly from the Tesseract GitHub repository. If `C:\Program Files\Tesseract-OCR\tessdata\` requires admin rights, falls back to a project-local `tessdata/` folder and writes `TESSDATA_PREFIX` to `.env` (picked up automatically by `start.bat`).
+
+### Port
+
+Default port is **7000**. If 7000 is in use, `start.bat` automatically tries 7001–7009. Port 8000 is intentionally avoided as Windows (Hyper-V / WSL) commonly reserves it.
+
+---
+
 ## CLI Reference
 
 ### `split_pdfs.py` — Split PDFs into Pages
@@ -259,7 +346,7 @@ Options:
   --dry-run         List pending pairs without processing
   --reset           Reset checkpoint and output for a directory
   --part PARTS      Filter by part number: single (101), range (50-100), or mixed (1,5,10-20)
-  --page N          Target a specific page number (use with --validate to inspect a known data page)
+  --page PAGES      Page number, range, or list (e.g., 4, 1-10, 1,5,10-20). Requires --part.
   --workers N       Number of parallel workers (default: 4)
   --limit N         Process only N pairs, then stop
   --cross-check     Cross-validate EPIC ID, House No, and serial between English and Tamil cells.
@@ -276,6 +363,8 @@ Part filtering examples:
 Validation examples:
   python extract_ocr.py AC-188 --validate                # Validate first pending pair
   python extract_ocr.py AC-188 --part 3 --page 4 --validate   # Validate specific page
+  python extract_ocr.py AC-188 --part 3 --page 1-10          # Process pages 1 through 10
+  python extract_ocr.py AC-188 --part 3 --page 1,5,10-20     # Specific pages and ranges
   python extract_ocr.py AC-188 --part 3 --page 4 --validate --cross-check  # With cross-check
 ```
 
@@ -403,15 +492,18 @@ Each extraction run generates:
 
 | Issue | Solution |
 |-------|----------|
-| `setup.bat` fails to install Tesseract | `winget` may not be available on your system. Install Tesseract manually from [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki), then re-run `setup.bat` |
-| `Tesseract OCR not found` | Verify install path; check that `C:\Program Files\Tesseract-OCR\tesseract.exe` exists |
+| `setup.bat` fails to install Tesseract | `winget` may not be available. Install manually from [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki), then re-run `setup.bat` |
+| `Tesseract OCR not found` | Verify `C:\Program Files\Tesseract-OCR\tesseract.exe` exists |
 | `No module named 'fitz'` | Run `pip install pymupdf` |
 | Tamil names are empty | Verify `tam` appears in `tesseract --list-langs` |
 | `Grid detection failed` | Falls back to proportional splitting automatically |
 | Processing is slow | Reduce `--workers` if RAM is limited; increase for faster CPUs |
-| `Permission denied` on tessdata | Copy `tam.traineddata` using an admin terminal |
+| `Permission denied` on tessdata | Use the Web UI Setup tab (auto-falls back to project-local folder), or copy with an admin terminal |
 | Unicode errors on Windows | The script handles UTF-8 encoding automatically |
 | Merge missing new pages | Use `python merge_outputs.py --ac AC-xxx --force` to re-merge |
+| Web UI: `can't reach localhost:7000` | Port 7000 may be in use — `start.bat` tries 7000–7009 automatically |
+| Web UI: `fastapi` not found | Run `pip install fastapi uvicorn aiofiles psutil` or let `start.bat` install them |
+| Web UI: job shows error immediately | Check Live Logs tab — the subprocess exit message explains the cause |
 
 ## Known Limitations
 
@@ -421,6 +513,29 @@ Each extraction run generates:
 - **Processing speed**: ~60s per page pair due to Tesseract OCR overhead and multi-strategy voting; parallelized with `--workers`
 
 ## Changelog
+
+### v1.4 (2026-03-17)
+
+- **Web UI** (`start.bat` / `start.sh`): Browser-based dashboard at `http://localhost:7000`
+  - **Setup tab**: dependency checker for Python packages, Tesseract binary, and Tamil tessdata — with one-click installation and live progress streaming
+  - **Workflow tab**: AC selector, step-by-step pipeline (Split → Extract → Merge → Analyze) with all CLI options exposed as UI controls
+  - **Create new AC**: `+` button next to AC dropdown creates `Input/ER_Downloads/AC-xxx/{english,tamil}/` directories from the UI
+  - **Full Extract CLI parity**: `--part`, `--page`, `--limit`, `--cross-check`, `--reset` exposed as UI controls; plus standalone **Dry Run** and **Validate Page** buttons
+  - **Count mismatch guidance**: When English/Tamil PDF counts differ, warning links to [voters.eci.gov.in](https://voters.eci.gov.in/) for re-download
+  - **Page range support**: `--page` now accepts ranges and lists (e.g., `1-10`, `1,5,10-20`) — same syntax as `--part`
+  - **Sidebar navigation**: Workflow, Live Logs, Data, History as vertical sidebar (desktop) / bottom bar (mobile); Setup as collapsible panel via gear icon
+  - **Collapsible step info**: Each pipeline step has an `ℹ` button explaining what it does and where output goes
+  - **Reset confirmation**: `--reset` checkbox shows a confirm dialog before clearing checkpoint data
+  - **System resources panel**: RAM-aware worker count recommendation, disk space warning with estimated output size
+  - **Input file validator**: checks English/Tamil PDF count match before running
+  - **Quick Validate / Preview**: "Test 1 Page" button with inline extracted-records table
+  - **Live Logs tab**: real-time SSE log streaming, colour-coded output, ETA estimator, kill button
+  - **Overnight Queue**: queue multiple ACs for sequential unattended processing; state persisted to `web/queue_state.json`
+  - **Browser notifications**: fired on job/queue completion
+  - **Data tab**: AC overview table, CSV download, per-AC progress
+  - **History tab**: log file browser and run summary viewer
+  - **Dark mode** default with toggle; port auto-detection (7000–7009)
+- CLI workflow unchanged — all existing commands work exactly as before
 
 ### v1.3 (2026-03-16)
 

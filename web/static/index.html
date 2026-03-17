@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Electoral Roll OCR</title>
+
+  <!-- Tailwind CDN with dark mode class strategy -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: {} }
+    }
+  </script>
+
+  <!-- Alpine.js -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+
+  <!-- Custom styles -->
+  <link rel="stylesheet" href="/static/style.css">
+
+  <script>
+    // Apply dark mode before first render to avoid flash
+    (function() {
+      const saved = localStorage.getItem('darkMode');
+      if (saved === 'false') document.documentElement.classList.remove('dark');
+    })();
+  </script>
+</head>
+
+<body
+  class="bg-gray-950 text-gray-200 min-h-screen"
+  x-data="app()"
+  x-init="init()"
+>
+
+<!-- ═══════════════════════════════════════════════════════ NAVBAR ══ -->
+<nav class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+  <div class="flex items-center gap-3">
+    <span class="text-lg font-bold text-white tracking-tight">Electoral Roll OCR</span>
+    <span class="text-xs bg-indigo-700 text-indigo-100 px-2 py-0.5 rounded-full font-medium">v1.4</span>
+  </div>
+  <div class="flex items-center gap-4">
+    <!-- Server status dot -->
+    <span class="flex items-center gap-1.5 text-sm">
+      <span class="w-2 h-2 rounded-full"
+            :class="serverOk ? 'bg-green-400 animate-pulse' : 'bg-red-500'"></span>
+      <span class="text-gray-400 text-xs" x-text="serverOk ? 'Connected' : 'Offline'"></span>
+    </span>
+    <!-- Notification permission -->
+    <button @click="requestNotificationPermission()"
+            title="Enable desktop notifications"
+            class="text-gray-500 hover:text-gray-300 text-sm">🔔</button>
+    <!-- Dark mode toggle -->
+    <button @click="toggleDark()" title="Toggle dark/light mode"
+            class="text-gray-400 hover:text-white text-lg leading-none">
+      <span x-text="darkMode ? '☀' : '🌙'"></span>
+    </button>
+  </div>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ LAYOUT ══ -->
+<div class="flex min-h-[calc(100vh-52px)]">
+
+  <!-- SIDEBAR (desktop only) -->
+  <aside class="hidden lg:flex flex-col w-48 bg-gray-900 border-r border-gray-800 sticky top-[52px] h-[calc(100vh-52px)] shrink-0">
+    <button @click="showSetup = !showSetup"
+            :class="showSetup ? 'bg-gray-800 text-indigo-400 border-l-2 border-indigo-500' : 'text-gray-400 border-l-2 border-transparent'"
+            class="flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-800 hover:text-white border-b border-gray-800 transition-colors">
+      ⚙ Setup
+    </button>
+    <template x-for="tab in tabs" :key="tab.id">
+      <button
+        @click="activeTab = tab.id; showSetup = false"
+        :class="activeTab === tab.id && !showSetup
+          ? 'border-l-2 border-indigo-500 text-white bg-gray-800'
+          : 'border-l-2 border-transparent text-gray-400 hover:text-white hover:bg-gray-800'"
+        class="relative flex items-center gap-2 px-4 py-3 text-sm font-medium transition-colors text-left"
+      >
+        <span x-text="tab.label"></span>
+        <span x-show="tab.badge"
+              class="w-2 h-2 bg-red-500 rounded-full"></span>
+      </button>
+    </template>
+  </aside>
+
+  <!-- MOBILE BOTTOM BAR (below lg) -->
+  <div class="lg:hidden fixed bottom-0 left-0 right-0 bg-gray-900 border-t border-gray-800 flex z-40">
+    <button @click="showSetup = !showSetup"
+            :class="showSetup ? 'text-indigo-400 bg-gray-800' : 'text-gray-400'"
+            class="flex-1 py-3 text-xs text-center hover:bg-gray-800">⚙</button>
+    <template x-for="tab in tabs" :key="tab.id">
+      <button @click="activeTab = tab.id; showSetup = false"
+              :class="activeTab === tab.id && !showSetup ? 'text-white bg-gray-800' : 'text-gray-400'"
+              class="flex-1 py-3 text-xs text-center hover:bg-gray-800"
+              x-text="tab.label"></button>
+    </template>
+  </div>
+
+  <!-- MAIN CONTENT -->
+  <main class="flex-1 p-5 max-w-7xl mx-auto lg:pb-5 pb-16">
+
+  <!-- ══════════════════════════ SETUP PANEL (collapsible) ══ -->
+  <div x-show="showSetup" x-transition x-cloak>
+    <div class="flex items-center justify-between mb-5">
+      <h2 class="text-xl font-semibold text-white">Setup &amp; Dependencies</h2>
+      <button @click="runSetupCheck()"
+              :disabled="checkingSetup"
+              class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded text-sm font-medium">
+        <span x-text="checkingSetup ? '⟳ Checking…' : '↺ Re-check All'"></span>
+      </button>
+    </div>
+
+    <!-- Loading state -->
+    <div x-show="!setupChecks && checkingSetup" class="text-gray-400 text-center py-12">
+      Checking dependencies…
+    </div>
+
+    <div x-show="setupChecks" class="space-y-4">
+
+      <!-- OCR Packages card -->
+      <div class="bg-gray-900 border rounded-lg p-5"
+           :class="setupChecks?.checks?.ocr_packages?.ok ? 'border-gray-700' : 'border-red-700'">
+        <div class="flex items-start justify-between">
+          <div>
+            <div class="flex items-center gap-2">
+              <span x-text="setupChecks?.checks?.ocr_packages?.ok ? '✅' : '❌'" class="text-lg"></span>
+              <span class="font-semibold text-white">Python OCR Packages</span>
+            </div>
+            <p class="text-gray-400 text-sm mt-1">PyMuPDF, OpenCV, pytesseract, NumPy, Pillow, pypdf</p>
+            <div class="mt-3 grid grid-cols-2 gap-1 text-xs">
+              <template x-for="[pkg, info] in Object.entries(setupChecks?.checks?.ocr_packages?.details || {})" :key="pkg">
+                <span :class="info.ok ? 'text-green-400' : 'text-red-400'">
+                  <span x-text="info.ok ? '✓' : '✗'"></span>
+                  <span x-text="pkg"></span>
+                  <span class="text-gray-500" x-text="info.ok ? info.version : 'missing'"></span>
+                </span>
+              </template>
+            </div>
+          </div>
+          <button
+            x-show="!setupChecks?.checks?.ocr_packages?.ok"
+            @click="installDep('ocr_packages')"
+            :disabled="installJobs['ocr_packages']?.status === 'running'"
+            class="ml-4 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded text-sm whitespace-nowrap">
+            <span x-text="installJobs['ocr_packages']?.status === 'running' ? '⟳ Installing…' : 'Install'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Tesseract Binary card -->
+      <div class="bg-gray-900 border rounded-lg p-5"
+           :class="setupChecks?.checks?.tesseract_binary?.ok ? 'border-gray-700' : 'border-red-700'">
+        <div class="flex items-start justify-between">
+          <div>
+            <div class="flex items-center gap-2">
+              <span x-text="setupChecks?.checks?.tesseract_binary?.ok ? '✅' : '❌'" class="text-lg"></span>
+              <span class="font-semibold text-white">Tesseract OCR Binary</span>
+            </div>
+            <p class="text-gray-400 text-sm mt-1" x-text="setupChecks?.checks?.tesseract_binary?.ok
+              ? setupChecks.checks.tesseract_binary.version + ' — ' + setupChecks.checks.tesseract_binary.path
+              : 'Not found — required for OCR'"></p>
+          </div>
+          <div x-show="!setupChecks?.checks?.tesseract_binary?.ok" class="ml-4 flex flex-col gap-2">
+            <button @click="installDep('tesseract_binary')"
+                    :disabled="installJobs['tesseract_binary']?.status === 'running'"
+                    class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded text-sm">
+              <span x-text="installJobs['tesseract_binary']?.status === 'running' ? '⟳ Installing…' : 'Auto Install (winget)'"></span>
+            </button>
+            <a :href="setupChecks?.checks?.tesseract_binary?.manual_url" target="_blank"
+               class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm text-center">
+              Manual Download ↗
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tamil Tessdata card -->
+      <div class="bg-gray-900 border rounded-lg p-5"
+           :class="setupChecks?.checks?.tamil_tessdata?.ok ? 'border-gray-700' : 'border-yellow-700'">
+        <div class="flex items-start justify-between">
+          <div>
+            <div class="flex items-center gap-2">
+              <span x-text="setupChecks?.checks?.tamil_tessdata?.ok ? '✅' : '⚠️'" class="text-lg"></span>
+              <span class="font-semibold text-white">Tamil Language Data (tam.traineddata)</span>
+            </div>
+            <p class="text-gray-400 text-sm mt-1" x-text="setupChecks?.checks?.tamil_tessdata?.ok
+              ? 'Found at: ' + setupChecks.checks.tamil_tessdata.tessdata_dir
+              : 'Not found — required for Tamil name extraction'"></p>
+          </div>
+          <button
+            x-show="!setupChecks?.checks?.tamil_tessdata?.ok"
+            @click="installDep('tamil_tessdata')"
+            :disabled="installJobs['tamil_tessdata']?.status === 'running'"
+            class="ml-4 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded text-sm whitespace-nowrap">
+            <span x-text="installJobs['tamil_tessdata']?.status === 'running' ? '⟳ Downloading…' : 'Download'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- All OK banner -->
+      <div x-show="setupChecks?.all_ok"
+           class="bg-green-900 border border-green-700 rounded-lg p-4 text-green-300 text-sm">
+        ✅ All dependencies installed — ready to process electoral rolls.
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════════════════ TAB 2: WORKFLOW ══ -->
+  <div x-show="activeTab === 'workflow'" x-cloak>
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+
+      <!-- LEFT: AC selection + status -->
+      <div class="lg:col-span-1 space-y-4">
+
+        <!-- AC selector -->
+        <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+          <label class="block text-sm font-medium text-gray-300 mb-2">Assembly Constituency</label>
+          <div class="flex gap-2">
+            <select x-model="selectedAc" @change="selectAc(selectedAc)"
+                    class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white text-sm">
+              <option value="">— Select AC —</option>
+              <template x-for="a in acs" :key="a.ac">
+                <option :value="a.ac" x-text="`${a.ac} (${a.checkpoint_pct}%)`"></option>
+              </template>
+            </select>
+            <button @click="loadAcs()" title="Refresh"
+                    class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm">↺</button>
+            <button @click="createAc()" title="Create new AC input"
+                    class="px-3 py-2 bg-green-700 hover:bg-green-600 rounded text-sm font-bold">+</button>
+          </div>
+        </div>
+
+        <!-- AC status card -->
+        <div x-show="acStatus" class="bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-3">
+          <h3 class="font-semibold text-white text-sm" x-text="selectedAc + ' — Status'"></h3>
+
+          <!-- File validation -->
+          <div :class="acStatus?.validation?.ok ? 'text-green-400' : 'text-yellow-400'" class="text-xs space-y-0.5">
+            <div x-text="`📁 English PDFs: ${acStatus?.validation?.en_count}`"></div>
+            <div x-text="`📁 Tamil PDFs:   ${acStatus?.validation?.ta_count}`"></div>
+            <template x-for="issue in (acStatus?.validation?.issues || [])" :key="issue">
+              <div>
+                <div class="text-yellow-400">⚠ <span x-text="issue"></span></div>
+                <div x-show="issue.toLowerCase().includes('mismatch')" class="text-xs text-gray-400 mt-1 ml-5">
+                  Check downloaded files for extras/missing parts, or re-download from
+                  <a href="https://voters.eci.gov.in/" target="_blank" rel="noopener"
+                     class="text-indigo-400 hover:text-indigo-300 underline">voters.eci.gov.in</a>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <!-- Progress bar -->
+          <div>
+            <div class="flex justify-between text-xs text-gray-400 mb-1">
+              <span>Extraction progress</span>
+              <span x-text="`${acStatus?.processed || 0} / ${acStatus?.total_pdfs || 0} pages`"></span>
+            </div>
+            <div class="w-full bg-gray-700 rounded-full h-2">
+              <div class="progress-bar-inner h-2 rounded-full bg-indigo-500"
+                   :style="`width: ${acStatus?.checkpoint_pct || 0}%`"></div>
+            </div>
+            <div class="text-right text-xs text-gray-500 mt-0.5"
+                 x-text="`${acStatus?.checkpoint_pct || 0}%`"></div>
+          </div>
+
+          <div class="flex gap-3 text-xs">
+            <span :class="acStatus?.has_downloads ? 'text-green-400' : 'text-gray-500'">
+              <span x-text="acStatus?.has_downloads ? '✓' : '○'"></span> Downloads
+            </span>
+            <span :class="acStatus?.has_split ? 'text-green-400' : 'text-gray-500'">
+              <span x-text="acStatus?.has_split ? '✓' : '○'"></span> Split
+            </span>
+            <span :class="acStatus?.has_merged ? 'text-green-400' : 'text-gray-500'">
+              <span x-text="acStatus?.has_merged ? '✓' : '○'"></span> Merged
+            </span>
+          </div>
+
+          <!-- Record count -->
+          <div x-show="acStatus?.record_count > 0" class="text-xs text-gray-400">
+            Records extracted: <span class="text-white font-semibold" x-text="acStatus?.record_count?.toLocaleString()"></span>
+          </div>
+        </div>
+
+        <!-- System resources -->
+        <div x-show="systemResources" class="bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-3">
+          <h3 class="font-semibold text-white text-sm">System Resources</h3>
+
+          <div class="space-y-2 text-xs">
+            <div class="flex justify-between">
+              <span class="text-gray-400">CPU cores</span>
+              <span class="text-white" x-text="systemResources?.cpu_cores"></span>
+            </div>
+            <template x-if="systemResources?.ram_total_gb">
+              <div class="flex justify-between">
+                <span class="text-gray-400">RAM available</span>
+                <span class="text-white"
+                      x-text="`${systemResources?.ram_available_gb} / ${systemResources?.ram_total_gb} GB`"></span>
+              </div>
+            </template>
+            <template x-if="systemResources?.disk_free_gb">
+              <div class="flex justify-between">
+                <span class="text-gray-400">Disk free</span>
+                <span :class="systemResources?.disk_warning ? 'text-yellow-400' : 'text-white'"
+                      x-text="`${systemResources?.disk_free_gb} GB`"></span>
+              </div>
+            </template>
+          </div>
+
+          <!-- Workers slider -->
+          <div>
+            <div class="flex justify-between text-xs mb-1">
+              <span class="text-gray-300">Workers</span>
+              <span :class="{'text-green-400': workersColor()==='workers-green', 'text-yellow-400': workersColor()==='workers-yellow', 'text-red-400': workersColor()==='workers-red'}"
+                    x-text="`${extractWorkers}  ${workersLabel()}`"></span>
+            </div>
+            <input type="range" min="1" :max="(systemResources?.cpu_cores || 8)"
+                   x-model.number="extractWorkers"
+                   class="workers-slider w-full"
+                   :class="workersColor()">
+          </div>
+
+          <!-- Disk warning -->
+          <div x-show="diskWarningText()"
+               class="text-xs text-yellow-400 bg-yellow-900/30 rounded p-2"
+               x-text="diskWarningText()"></div>
+        </div>
+
+      </div>
+
+      <!-- RIGHT: Pipeline + Queue -->
+      <div class="lg:col-span-2 space-y-4">
+
+        <!-- Pipeline steps -->
+        <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+          <h3 class="font-semibold text-white mb-4">Pipeline</h3>
+
+          <div class="space-y-3">
+
+            <!-- Step 1: Split -->
+            <div class="step-card bg-gray-800 border border-gray-700 rounded-lg p-4">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="font-medium text-white">1. Split PDFs</span>
+                  <button @click="splitInfoOpen = !splitInfoOpen" title="More info"
+                          class="text-gray-500 hover:text-gray-300 text-xs border border-gray-600 rounded-full w-4 h-4 flex items-center justify-center leading-none">i</button>
+                </div>
+                <button @click="runStep('split')" :disabled="!selectedAc"
+                        class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded text-sm">
+                  ▶ Run
+                </button>
+              </div>
+              <p class="text-xs text-gray-400 mt-0.5">Split multi-page downloads into single-page files</p>
+              <div class="mt-3 flex items-center gap-3 text-sm">
+                <label class="flex items-center gap-1.5 text-gray-300 cursor-pointer">
+                  <input type="checkbox" x-model="splitForce" class="rounded bg-gray-700">
+                  <span>--force (overwrite existing)</span>
+                </label>
+              </div>
+              <div x-show="splitInfoOpen" x-transition class="mt-3 text-xs text-gray-400 bg-gray-900 rounded p-3 border border-gray-700">
+                This splits each multi-page PDF into individual page files. All pages are split — non-data pages
+                (metadata, summary, maps) are auto-detected and skipped during extraction in Step 3.
+                Output goes to <code class="text-gray-300">Input/split_files/<span x-text="selectedAc || 'AC-xxx'"></span>/{english,tamil}/</code>.
+              </div>
+            </div>
+
+            <!-- Step 2: Extract -->
+            <div class="step-card bg-gray-800 border border-gray-700 rounded-lg p-4">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="font-medium text-white">2. Extract (OCR)</span>
+                  <button @click="extractInfoOpen = !extractInfoOpen" title="More info"
+                          class="text-gray-500 hover:text-gray-300 text-xs border border-gray-600 rounded-full w-4 h-4 flex items-center justify-center leading-none">i</button>
+                </div>
+                <button @click="runStep('extract')" :disabled="!selectedAc"
+                        class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded text-sm">
+                  ▶ Run
+                </button>
+              </div>
+              <p class="text-xs text-gray-400 mt-0.5">Run Tesseract OCR on each page pair</p>
+
+              <div class="mt-3 space-y-3">
+                <!-- Row 1: Part + Page + Limit -->
+                <div class="grid grid-cols-3 gap-3 text-sm">
+                  <div>
+                    <label class="text-xs text-gray-400 block mb-1">--part <span class="text-gray-600">(range)</span></label>
+                    <input type="text" x-model="extractPart" placeholder="e.g. 1-50 or 3"
+                           class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-white text-sm">
+                  </div>
+                  <div>
+                    <label class="text-xs text-gray-400 block mb-1">--page <span class="text-gray-600">(with --part)</span></label>
+                    <input type="text" x-model="extractPage" placeholder="e.g. 4 or 1-10"
+                           :disabled="!extractPart"
+                           class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-white text-sm disabled:opacity-40">
+                  </div>
+                  <div>
+                    <label class="text-xs text-gray-400 block mb-1">--limit <span class="text-gray-600">(0=all)</span></label>
+                    <input type="number" x-model.number="extractLimit" placeholder="0" min="0"
+                           class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-white text-sm">
+                  </div>
+                </div>
+
+                <!-- Row 2: Checkboxes -->
+                <div class="flex flex-wrap gap-4 text-sm">
+                  <label class="flex items-center gap-1.5 text-gray-300 cursor-pointer">
+                    <input type="checkbox" x-model="extractCrossCheck" class="rounded bg-gray-700">
+                    <span>--cross-check</span>
+                  </label>
+                  <label class="flex items-center gap-1.5 text-yellow-400 cursor-pointer">
+                    <input type="checkbox" x-model="extractReset" class="rounded bg-gray-700">
+                    <span>--reset <span class="text-gray-500 text-xs">(clear checkpoint)</span></span>
+                  </label>
+                </div>
+
+                <!-- Row 3: Utility buttons -->
+                <div class="flex gap-2">
+                  <button @click="runDryRun()" :disabled="!selectedAc"
+                          class="px-3 py-1.5 bg-gray-600 hover:bg-gray-500 disabled:opacity-40 rounded text-xs">
+                    Dry Run (show pending)
+                  </button>
+                  <button @click="runValidatePage()" :disabled="!selectedAc"
+                          class="px-3 py-1.5 bg-gray-600 hover:bg-gray-500 disabled:opacity-40 rounded text-xs">
+                    Validate Page
+                  </button>
+                </div>
+              </div>
+
+              <!-- Collapsible info -->
+              <div x-show="extractInfoOpen" x-transition class="mt-3 text-xs text-gray-400 bg-gray-900 rounded p-3 border border-gray-700 space-y-1">
+                <div><code class="text-gray-300">--part</code> — Process specific part number or range (e.g., "101" or "50-100")</div>
+                <div><code class="text-gray-300">--page</code> — Target specific pages within a part (e.g., "4", "1-10", "1,5,10-20"). Requires --part.</div>
+                <div><code class="text-gray-300">--limit</code> — Max pairs to process (0 = all). Useful for testing a few pages first</div>
+                <div><code class="text-gray-300">--cross-check</code> — Cross-validate EN vs TA cells, adds 2 extra columns (Cross_Check, Cross_Check_Notes)</div>
+                <div><code class="text-gray-300">--reset</code> — Clear checkpoint for specified part, allowing re-processing</div>
+                <div><span class="text-gray-300">Dry Run</span> — Show pending file pairs without processing</div>
+                <div><span class="text-gray-300">Validate Page</span> — Test one page with detailed output (opens in Live Logs)</div>
+              </div>
+            </div>
+
+            <!-- Step 3: Merge -->
+            <div class="step-card bg-gray-800 border border-gray-700 rounded-lg p-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <span class="font-medium text-white">3. Merge Outputs</span>
+                  <p class="text-xs text-gray-400 mt-0.5">Combine page CSVs into part and AC-level files</p>
+                </div>
+                <button @click="runStep('merge')" :disabled="!selectedAc"
+                        class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded text-sm">
+                  ▶ Run
+                </button>
+              </div>
+              <div class="mt-3 flex items-center gap-3 text-sm">
+                <label class="flex items-center gap-1.5 text-gray-300 cursor-pointer">
+                  <input type="checkbox" x-model="mergeForce" class="rounded bg-gray-700">
+                  <span>--force (re-merge all)</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Step 4: Analyze -->
+            <div class="step-card bg-gray-800 border border-gray-700 rounded-lg p-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <span class="font-medium text-white">4. Analyze Quality</span>
+                  <p class="text-xs text-gray-400 mt-0.5">Validate extraction accuracy and field fill rates</p>
+                </div>
+                <button @click="runStep('analyze')" :disabled="!selectedAc"
+                        class="px-4 py-1.5 bg-gray-600 hover:bg-gray-500 disabled:opacity-40 rounded text-sm">
+                  ▶ Run
+                </button>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Full pipeline + validate buttons -->
+          <div class="mt-4 flex flex-wrap gap-3">
+            <button @click="runPipeline()" :disabled="!selectedAc"
+                    class="flex-1 py-2 bg-green-700 hover:bg-green-600 disabled:opacity-40 rounded font-medium text-sm">
+              ⚡ Run Full Pipeline (Split → Extract → Merge)
+            </button>
+            <button @click="runValidate()" :disabled="!selectedAc || previewLoading"
+                    class="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 rounded text-sm">
+              <span x-text="previewLoading ? '⟳ Testing…' : '🔍 Test 1 Page'"></span>
+            </button>
+          </div>
+
+          <!-- Preview table -->
+          <div x-show="previewRows !== null" class="mt-4">
+            <h4 class="text-sm font-medium text-gray-300 mb-2">
+              Preview
+              <span class="text-gray-500 font-normal" x-text="previewFile ? `— ${previewFile}` : ''"></span>
+            </h4>
+            <div x-show="previewRows && previewRows.length === 0" class="text-gray-500 text-sm">
+              No records in preview page.
+            </div>
+            <div x-show="previewRows && previewRows.length > 0" class="overflow-x-auto">
+              <table class="w-full text-xs border-collapse">
+                <thead>
+                  <tr class="bg-gray-800">
+                    <template x-for="col in previewColumns()" :key="col">
+                      <th class="px-2 py-1.5 text-left text-gray-400 border-b border-gray-700 whitespace-nowrap"
+                          x-text="col"></th>
+                    </template>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="(row, idx) in previewRows" :key="idx">
+                    <tr :class="idx % 2 === 0 ? 'bg-gray-900' : 'bg-gray-850'">
+                      <template x-for="col in previewColumns()" :key="col">
+                        <td class="px-2 py-1.5 border-b border-gray-800 text-gray-300 max-w-32 truncate"
+                            :title="row[col]" x-text="row[col]"></td>
+                      </template>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Overnight Queue -->
+        <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="font-semibold text-white">Overnight Queue</h3>
+            <div class="flex gap-2">
+              <button @click="addToQueue()" :disabled="!selectedAc"
+                      class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded text-sm">
+                + Add Selected AC
+              </button>
+              <button x-show="!queueRunning" @click="startQueue()"
+                      :disabled="queueItems.filter(i=>i.status==='waiting').length === 0"
+                      class="px-3 py-1.5 bg-green-700 hover:bg-green-600 disabled:opacity-40 rounded text-sm">
+                ▶ Start Queue
+              </button>
+              <button x-show="queueRunning" @click="stopQueue()"
+                      class="px-3 py-1.5 bg-yellow-700 hover:bg-yellow-600 rounded text-sm">
+                ⏹ Stop After Current
+              </button>
+            </div>
+          </div>
+
+          <div x-show="queueItems.length === 0" class="text-gray-500 text-sm py-4 text-center">
+            Queue is empty — add ACs above to run overnight.
+          </div>
+
+          <div class="space-y-2">
+            <template x-for="item in queueItems" :key="item.ac">
+              <div class="flex items-center justify-between bg-gray-800 rounded px-3 py-2 text-sm">
+                <div class="flex items-center gap-3">
+                  <span class="font-medium text-white" x-text="item.ac"></span>
+                  <span class="text-xs px-2 py-0.5 rounded font-medium"
+                        :class="queueItemColor(item.status)"
+                        x-text="item.status + (item.current_step ? ' — ' + item.current_step : '')"></span>
+                  <span class="text-gray-500 text-xs"
+                        x-text="`${item.workers}w${item.cross_check ? ' +CC' : ''}`"></span>
+                </div>
+                <button x-show="item.status === 'waiting'"
+                        @click="removeFromQueue(item.ac)"
+                        class="text-gray-500 hover:text-red-400 text-lg leading-none">×</button>
+              </div>
+            </template>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════ TAB 3: LIVE LOGS ══ -->
+  <div x-show="activeTab === 'logs'" x-cloak>
+    <div class="flex items-center gap-3 mb-4 flex-wrap">
+      <select x-model="activeJobId" @change="switchJob(activeJobId)"
+              class="bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white text-sm flex-1 min-w-0">
+        <option value="">— Select job —</option>
+        <template x-for="job in recentJobs" :key="job.job_id">
+          <option :value="job.job_id"
+                  x-text="`${job.job_id}  [${job.status}]`"></option>
+        </template>
+      </select>
+
+      <span class="text-xs px-3 py-1.5 rounded font-medium"
+            :class="statusBadgeClass(activeJobStatus)"
+            x-text="activeJobStatus || '—'"></span>
+
+      <span x-show="etaText" class="text-xs text-indigo-300 bg-indigo-900/40 px-2 py-1 rounded"
+            x-text="etaText"></span>
+
+      <label class="flex items-center gap-1.5 text-sm text-gray-300 cursor-pointer">
+        <input type="checkbox" x-model="autoScroll" class="rounded">
+        Auto-scroll
+      </label>
+
+      <button @click="killActiveJob()"
+              :disabled="activeJobStatus !== 'running'"
+              class="px-3 py-1.5 bg-red-800 hover:bg-red-700 disabled:opacity-40 rounded text-sm font-medium">
+        ⏹ Kill
+      </button>
+
+      <button @click="loadRecentJobs()" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">↺</button>
+    </div>
+
+    <!-- Log terminal -->
+    <div id="log-terminal" class="log-terminal">
+      <div x-show="logLines.length === 0" class="text-gray-600">
+        No output yet — run a job from the Workflow tab.
+      </div>
+      <template x-for="(line, idx) in logLines" :key="idx">
+        <div :class="line.cls" x-text="line.text"></div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════ TAB 4: DATA ══ -->
+  <div x-show="activeTab === 'data'" x-cloak>
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-xl font-semibold text-white">Data &amp; Downloads</h2>
+      <div class="text-sm text-gray-400">
+        Total records: <span class="text-white font-bold" x-text="totalRecords().toLocaleString()"></span>
+      </div>
+    </div>
+
+    <div x-show="dataAcs.length === 0" class="text-gray-500 text-center py-12">
+      No ACs found — check that Input/ER_Downloads/ contains AC-xxx directories.
+    </div>
+
+    <div class="space-y-2">
+      <template x-for="a in dataAcs" :key="a.ac">
+        <div class="bg-gray-900 border border-gray-700 rounded-lg overflow-hidden">
+
+          <!-- Row header -->
+          <div class="flex items-center justify-between px-4 py-3">
+            <div class="flex items-center gap-4">
+              <button @click="toggleExpandAc(a.ac)" class="text-gray-400 hover:text-white text-sm">
+                <span x-text="expandedAc === a.ac ? '▼' : '▶'"></span>
+              </button>
+              <span class="font-semibold text-white" x-text="a.ac"></span>
+              <div class="w-24 bg-gray-700 rounded-full h-1.5">
+                <div class="h-1.5 rounded-full bg-indigo-500 progress-bar-inner"
+                     :style="`width: ${a.checkpoint_pct}%`"></div>
+              </div>
+              <span class="text-xs text-gray-400" x-text="`${a.checkpoint_pct}%`"></span>
+              <span x-show="a.record_count > 0"
+                    class="text-xs text-gray-300"
+                    x-text="`${a.record_count?.toLocaleString()} records`"></span>
+            </div>
+            <div class="flex gap-2">
+              <button @click="downloadCsv(a.ac)"
+                      :disabled="!a.has_merged"
+                      class="px-3 py-1 bg-green-800 hover:bg-green-700 disabled:opacity-40 rounded text-xs font-medium">
+                ⬇ CSV
+              </button>
+              <button @click="selectedAc = a.ac; selectAc(a.ac); activeTab = 'workflow'"
+                      class="px-3 py-1 bg-indigo-800 hover:bg-indigo-700 rounded text-xs">
+                ▶ Process
+              </button>
+            </div>
+          </div>
+
+          <!-- Expanded detail -->
+          <div x-show="expandedAc === a.ac" class="border-t border-gray-800 px-4 py-3 bg-gray-900/50">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+              <div>
+                <span class="text-gray-500">Downloads</span>
+                <div :class="a.has_downloads ? 'text-green-400' : 'text-gray-600'"
+                     x-text="a.has_downloads ? '✓ Present' : '✗ Missing'"></div>
+              </div>
+              <div>
+                <span class="text-gray-500">Split pages</span>
+                <div :class="a.has_split ? 'text-green-400' : 'text-gray-600'"
+                     x-text="a.has_split ? '✓ Present' : '✗ Not split'"></div>
+              </div>
+              <div>
+                <span class="text-gray-500">Merged CSV</span>
+                <div :class="a.has_merged ? 'text-green-400' : 'text-gray-600'"
+                     x-text="a.has_merged ? '✓ Ready' : '✗ Not merged'"></div>
+              </div>
+              <div>
+                <span class="text-gray-500">File validation</span>
+                <div :class="a.validation?.ok ? 'text-green-400' : 'text-yellow-400'">
+                  <span x-text="a.validation?.ok ? '✓ OK' : '⚠ ' + (a.validation?.issues?.[0] || 'Issues')"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════ TAB 5: HISTORY ══ -->
+  <div x-show="activeTab === 'history'" x-cloak>
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+
+      <!-- Log file list -->
+      <div class="lg:col-span-1">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold text-white">Log Files</h3>
+          <button @click="loadLogFiles()" class="text-gray-400 hover:text-white text-sm">↺</button>
+        </div>
+        <div class="space-y-1 max-h-96 overflow-y-auto">
+          <div x-show="logFiles.length === 0" class="text-gray-500 text-sm py-4 text-center">
+            No log files found
+          </div>
+          <template x-for="lf in logFiles" :key="lf.name">
+            <button
+              @click="loadLogFile(lf.name)"
+              :class="selectedLogFile === lf.name ? 'bg-indigo-900 border-indigo-700' : 'bg-gray-900 border-gray-700 hover:bg-gray-800'"
+              class="w-full text-left border rounded px-3 py-2 text-xs"
+            >
+              <div class="font-medium text-gray-200 truncate" x-text="lf.name"></div>
+              <div class="text-gray-500 mt-0.5" x-text="`${lf.size_kb} KB`"></div>
+            </button>
+          </template>
+        </div>
+      </div>
+
+      <!-- Log viewer -->
+      <div class="lg:col-span-2">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold text-white">
+            <span x-text="selectedLogFile || 'Select a log file'"></span>
+            <span x-show="logFileTotalLines > 500"
+                  class="text-xs text-gray-500 font-normal ml-2"
+                  x-text="`(showing last 500 of ${logFileTotalLines} lines)`"></span>
+          </h3>
+          <button x-show="selectedLogFile"
+                  @click="downloadLog(selectedLogFile)"
+                  class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs">
+            ⬇ Download
+          </button>
+        </div>
+        <div class="log-terminal" style="height:480px">
+          <div x-show="!selectedLogFile" class="text-gray-600">
+            Select a log file to view its contents.
+          </div>
+          <template x-for="(line, idx) in logFileContent" :key="idx">
+            <div :class="_lineClass(line)" x-text="line"></div>
+          </template>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  </main>
+
+</div><!-- end flex layout -->
+
+<!-- ══════════════════════════════════════════════ TOAST CONTAINER ══ -->
+<div class="fixed bottom-5 right-5 flex flex-col gap-2 z-50 w-80">
+  <template x-for="t in toasts" :key="t.id">
+    <div class="toast border rounded-lg px-4 py-3 text-sm flex items-start justify-between shadow-xl"
+         :class="t.color">
+      <span x-text="t.message" class="flex-1 pr-2"></span>
+      <button @click="dismissToast(t.id)" class="opacity-60 hover:opacity-100 leading-none ml-1">×</button>
+    </div>
+  </template>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
