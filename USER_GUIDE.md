@@ -171,6 +171,16 @@ bash start.sh
 
 The browser opens automatically at `http://localhost:7000`. This is a local-only address — nothing is exposed to the network.
 
+### Stopping the Web UI
+
+When you're done, stop the server:
+
+1. Find the **terminal/command prompt window** that opened when you ran `start.bat`
+2. Press **`Ctrl+C`** in that window, or simply **close the window**
+3. Close the browser tab
+
+All your data, checkpoints, and queue state are saved to disk automatically. Next time you run `start.bat`, everything picks up where you left off.
+
 ### Understanding the Layout
 
 The UI has a **sidebar** on the left (desktop) or a **bottom bar** (mobile/small screens):
