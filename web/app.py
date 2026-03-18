@@ -21,8 +21,8 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # API routers
 app.include_router(routes_setup.router,    prefix="/api/setup")
-app.include_router(routes_jobs.router,     prefix="/api/jobs")
 app.include_router(routes_workflow.router, prefix="/api/jobs")
+app.include_router(routes_jobs.router,     prefix="/api/jobs")
 app.include_router(routes_files.router,    prefix="/api")
 
 

@@ -1,6 +1,6 @@
 # Electoral Roll OCR — User Guide
 
-**Version 1.4** | Last updated: 2026-03-17
+**Version 2.0** | Last updated: 2026-03-18
 
 ---
 
@@ -148,7 +148,7 @@ Here are the most common setup failures and how to fix them:
 |---------|----------|
 | `fastapi` not found | Run `pip install fastapi uvicorn aiofiles psutil` |
 | Port 7000 in use | The launcher auto-tries ports 7000-7009. If all are in use, close other applications or check with `netstat -ano \| findstr :7000` |
-| Unicode error on startup | This has been fixed in v1.4. If you see it, ensure you have the latest code |
+| Unicode error on startup | This has been fixed in v2.0. If you see it, ensure you have the latest code |
 | Browser doesn't open | Navigate manually to `http://localhost:7000` |
 
 **General tip:** If all else fails, try the Web UI Setup panel — it provides the most user-friendly installation experience with real-time progress streaming.
@@ -210,7 +210,7 @@ Input/ER_Downloads/AC-188/
     tamil/      <-- Tamil PDFs (e.g., 2026-EROLLGEN-...-TAM-1-WI.pdf)
 ```
 
-**Important:** The number of English and Tamil PDFs should match. If they don't, the UI will show a yellow warning with a link to re-download.
+**Important:** The number of English and Tamil PDFs should match. If they don't, the UI will show a yellow warning with a link to re-download. If a folder is empty, the UI will show the exact file path where PDFs should be saved.
 
 ### Step 2: Create or Select an AC
 
@@ -341,6 +341,7 @@ For processing multiple ACs unattended:
 - **Live Logs tab**: Real-time colour-coded output. Red = errors, yellow = warnings, green = success.
 - **ETA indicator**: Shows percentage complete and page count (e.g., "45% done (130/290 pages)")
 - **Kill button**: Red button to stop a running job immediately
+- **File path summary**: When a job completes, errors, or is killed, the log terminal shows the input and output file paths for that step
 
 ### Overall Progress
 
@@ -473,4 +474,4 @@ A: Pull the latest code (if using git) or download the updated files. Restart th
 
 ---
 
-*This guide covers the Electoral Roll OCR Tool v1.4. For technical details, see [README.md](README.md). For developer reference, see [CLAUDE.md](CLAUDE.md).*
+*This guide covers the Electoral Roll OCR Tool v2.0. For technical details, see [README.md](README.md). For developer reference, see [CLAUDE.md](CLAUDE.md).*

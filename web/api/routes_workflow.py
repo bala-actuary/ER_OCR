@@ -83,7 +83,7 @@ async def run_extract(req: ExtractRequest):
     if req.limit > 0:
         cmd += ["--limit", str(req.limit)]
     if req.reset:
-        cmd.append("--reset")
+        cmd += ["--reset", "--yes"]
     job = await job_manager.start_job("extract", cmd, req.ac)
     return {"job_id": job.job_id}
 

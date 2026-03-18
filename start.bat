@@ -48,30 +48,24 @@ if errorlevel 1 (
     echo [OK] Web dependencies present
 )
 
-REM ── Find a free port using Python ───────────────────────────────────────
-python -c "import socket,sys
-for p in range(7000,7010):
-    s=socket.socket()
-    try:
-        s.bind(('127.0.0.1',p))
-        s.close()
-        print(p)
-        sys.exit(0)
-    except OSError:
-        pass
-print(7000)" > "%TEMP%\ocr_port.txt" 2>nul
-set /p PORT=<"%TEMP%\ocr_port.txt"
-if not defined PORT set PORT=7000
+REM ── Find a free port (try 7000-7009) ────────────────────────────────────
+set PORT=7000
+for /f %%P in ('python "%~dp0_find_port.py"') do set "PORT=%%P"
+echo [OK] Using port %PORT%
 
 echo.
 echo ============================================
-echo   Open http://localhost:%PORT% in your browser
 echo   Press Ctrl+C to stop the server
 echo ============================================
 echo.
 
-REM ── Launch uvicorn ──────────────────────────────────────────────────────
+REM ── Change to script directory ──────────────────────────────────────────
 cd /d "%~dp0"
+
+REM ── Launch browser after server starts ──────────────────────────────────
+start /min "" python -c "import time,webbrowser;time.sleep(2);webbrowser.open('http://localhost:%PORT%')"
+
+REM ── Launch uvicorn ──────────────────────────────────────────────────────
 python -m uvicorn web.app:app --host 127.0.0.1 --port %PORT%
 
 echo.

@@ -154,6 +154,7 @@ class JobManager:
     async def _run(self, job: Job) -> None:
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         kwargs: dict = {
+            "stdin": asyncio.subprocess.DEVNULL,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.STDOUT,
             "env": env,

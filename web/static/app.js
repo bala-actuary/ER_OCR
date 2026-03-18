@@ -471,6 +471,7 @@ function app() {
         this.activeJobStatus = jd.status;
         this.loadRecentJobs();
         clearInterval(this.etaPollTimer);
+        this._appendPathLines(jd.step, jd.ac);
         if (jd.status === 'done') {
           this.toast(`Job ${jobId} completed`, 'success');
           this._sendBrowserNotification(`Job done: ${jd.step} ${jd.ac || ''}`);
@@ -484,6 +485,35 @@ function app() {
       es.onerror = () => {
         // EventSource reconnects automatically
       };
+    },
+
+    _pathsForJob(step, ac) {
+      if (!ac) return null;
+      const map = {
+        split:   { input: `Input/ER_Downloads/${ac}/`, output: `Input/split_files/${ac}/` },
+        extract: { input: `Input/split_files/${ac}/`, output: `output/split_files/${ac}/` },
+        merge:   { input: `output/split_files/${ac}/`, output: `output/merged_files/parts/${ac}/  &  output/merged_files/ac/${ac}.csv` },
+        analyze: { input: `output/merged_files/ac/${ac}.csv`, output: null },
+      };
+      return map[step] || null;
+    },
+
+    _appendPathLines(step, ac) {
+      const paths = this._pathsForJob(step, ac);
+      if (!paths) return;
+      const sep = '\u2500'.repeat(50);
+      this.logLines.push({ text: sep, cls: 'log-line-info' });
+      this.logLines.push({ text: `Input:  ${paths.input}`, cls: 'log-line-info' });
+      if (paths.output) {
+        this.logLines.push({ text: `Output: ${paths.output}`, cls: 'log-line-info' });
+      }
+      this.logLines.push({ text: sep, cls: 'log-line-info' });
+      if (this.autoScroll) {
+        this.$nextTick(() => {
+          const el = document.getElementById('log-terminal');
+          if (el) el.scrollTop = el.scrollHeight;
+        });
+      }
     },
 
     _lineClass(text) {
@@ -517,6 +547,9 @@ function app() {
       // Load buffered lines
       for (const line of (jd.log_lines || [])) {
         this.logLines.push({ text: line, cls: this._lineClass(line) });
+      }
+      if (jd.status !== 'running' && jd.status !== 'pending') {
+        this._appendPathLines(jd.step, jd.ac);
       }
       if (jd.status === 'running') {
         this._startSSE(jobId);

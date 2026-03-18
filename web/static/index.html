@@ -39,7 +39,7 @@
 <nav class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between sticky top-0 z-40">
   <div class="flex items-center gap-3">
     <span class="text-lg font-bold text-white tracking-tight">Electoral Roll OCR</span>
-    <span class="text-xs bg-indigo-700 text-indigo-100 px-2 py-0.5 rounded-full font-medium">v1.4</span>
+    <span class="text-xs bg-indigo-700 text-indigo-100 px-2 py-0.5 rounded-full font-medium">v2.0</span>
   </div>
   <div class="flex items-center gap-4">
     <!-- Server status dot -->
@@ -248,6 +248,14 @@
                   Check downloaded files for extras/missing parts, or re-download from
                   <a href="https://voters.eci.gov.in/" target="_blank" rel="noopener"
                      class="text-indigo-400 hover:text-indigo-300 underline">voters.eci.gov.in</a>
+                </div>
+                <div x-show="issue.toLowerCase().includes('no ') && issue.toLowerCase().includes('found')" class="text-xs text-gray-400 mt-1 ml-5">
+                  Download PDFs from
+                  <a href="https://voters.eci.gov.in/" target="_blank" rel="noopener"
+                     class="text-indigo-400 hover:text-indigo-300 underline">voters.eci.gov.in</a>
+                  and save to
+                  <code class="text-gray-300"
+                        x-text="`Input/ER_Downloads/${selectedAc}/${issue.toLowerCase().includes('english') ? 'english' : 'tamil'}/`"></code>
                 </div>
               </div>
             </template>

@@ -1,4 +1,4 @@
-# Electoral Roll OCR Extraction Tool (v1.4)
+# Electoral Roll OCR Extraction Tool (v2.0)
 
 Extracts voter data from Tamil Nadu electoral roll PDFs (English + Tamil pairs) into structured CSV files using local OCR. Completely offline, zero API cost, and achieves **99.87% cell-level accuracy** across 1,118 validated records.
 
@@ -248,7 +248,7 @@ When running with `--cross-check` or `--validate`, two additional columns are ap
 
 Cross-check columns are **never written** in normal production runs — they only appear when explicitly requested.
 
-## Web UI (v1.4)
+## Web UI (v2.0)
 
 ### Starting the UI
 
@@ -513,6 +513,11 @@ Each extraction run generates:
 - **Processing speed**: ~60s per page pair due to Tesseract OCR overhead and multi-strategy voting; parallelized with `--workers`
 
 ## Changelog
+
+### v2.0 (2026-03-18)
+
+- **Empty folder guidance**: When an AC has no English or Tamil PDFs, a helpful message now directs users to download from [voters.eci.gov.in](https://voters.eci.gov.in/) and shows the exact save path (e.g., `Input/ER_Downloads/AC-200/english/`)
+- **File path summary after jobs**: After any job completes, errors, or is killed, the Live Logs terminal appends a summary showing the input and output file paths for that step — also shown when switching to a completed job in the dropdown
 
 ### v1.4 (2026-03-17)
 

@@ -59,6 +59,7 @@ OCR_DIR = Path(__file__).parent          # ER_OCR/
 INPUT_BASE = OCR_DIR / "Input" / "split_files"
 OUTPUT_BASE = OCR_DIR / "output" / "split_files"
 MERGED_BASE = OCR_DIR / "output" / "merged_files" / "parts"
+AC_MERGED_DIR = OCR_DIR / "output" / "merged_files" / "ac"
 LOG_DIR = OCR_DIR / "logs"
 
 # Legacy paths (for backward compatibility with old checkpoint location)
@@ -2764,6 +2765,10 @@ def main():
         help="Reset checkpoint for directory"
     )
     parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip confirmation prompts (used by web UI)"
+    )
+    parser.add_argument(
         "--workers", type=int, default=4,
         help="Number of parallel workers (default: 4)"
     )
@@ -2862,8 +2867,15 @@ def main():
             if part_filter:
                 # Reset only specific parts
                 part_labels = sorted(part_filter)
-                response = input(f"Reset parts {part_labels} for {dir_name}? (y/N): ")
-                if response.lower() == "y":
+                if args.yes:
+                    confirmed = True
+                else:
+                    try:
+                        response = input(f"Reset parts {part_labels} for {dir_name}? (y/N): ")
+                        confirmed = response.lower() == "y"
+                    except (EOFError, OSError):
+                        confirmed = True  # non-interactive — auto-confirm
+                if confirmed:
                     checkpoint = load_checkpoint(dir_name)
                     old_count = len(checkpoint.get("processed", []))
                     checkpoint["processed"] = [
@@ -2897,10 +2909,22 @@ def main():
                         if merge_cp:
                             with open(merge_cp_path, "w") as f:
                                 json.dump(merge_cp, f, indent=2)
+                    # Also delete stale AC-level merged CSV
+                    ac_csv = AC_MERGED_DIR / f"{dir_name}.csv"
+                    if ac_csv.exists():
+                        ac_csv.unlink()
+                        log.info(f"Removed stale AC-level CSV: {ac_csv.name}")
                     log.info(f"Reset {removed} entries for parts {part_labels} in {dir_name} (incl. merged)")
             else:
-                response = input(f"Reset checkpoint for {dir_name}? (y/N): ")
-                if response.lower() == "y":
+                if args.yes:
+                    confirmed = True
+                else:
+                    try:
+                        response = input(f"Reset checkpoint for {dir_name}? (y/N): ")
+                        confirmed = response.lower() == "y"
+                    except (EOFError, OSError):
+                        confirmed = True  # non-interactive — auto-confirm
+                if confirmed:
                     if cp_file.exists():
                         cp_file.unlink()
                     output_dir = OUTPUT_BASE / dir_name
@@ -2914,8 +2938,21 @@ def main():
                         merge_cp = merged_dir / "merge_checkpoint.json"
                         if merge_cp.exists():
                             merge_cp.unlink()
+                    # Also delete AC-level merged CSV
+                    ac_csv = AC_MERGED_DIR / f"{dir_name}.csv"
+                    if ac_csv.exists():
+                        ac_csv.unlink()
+                        log.info(f"Removed AC-level CSV: {ac_csv.name}")
                     log.info(f"Reset complete for {dir_name} (incl. merged)")
-            continue
+            # After reset, ask whether to continue with extraction
+            if args.yes:
+                continue  # web UI: reset only, no extraction
+            try:
+                resp = input("Continue with extraction? (y/N): ")
+                if resp.lower() != "y":
+                    continue
+            except (EOFError, OSError):
+                continue  # non-interactive — stop after reset
 
         log.info(f"\n{'=' * 50}")
         log.info(f"Processing: {dir_name}")
